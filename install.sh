@@ -17,6 +17,9 @@ if [ ! -f .env ]; then
 fi
 
 cp rust-bot.service /etc/systemd/system/rust-bot.service
+cp rust-bot-update.service rust-bot-update.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable rust-bot
+systemctl enable --now rust-bot-update.timer
 echo ">>> Готово. После заполнения .env запусти: systemctl restart rust-bot"
+echo ">>> Автообновление включено: сервер сам проверяет GitHub раз в минуту."

@@ -7,5 +7,7 @@ Discord-бот клана по Rust: ежедневная проверка он�
 
 ## Деплой на сервер
 Первичная установка: `bash install.sh`
-Обновление после пуша: `bash update.sh`
-Логи: `journalctl -u rust-bot -f`
+Автообновление: таймер `rust-bot-update` раз в минуту проверяет GitHub и при новых коммитах сам обновляет и перезапускает бота.
+Принудительно вручную: `bash update.sh`
+Логи бота: `journalctl -u rust-bot -f`
+Логи автообновления: `journalctl -u rust-bot-update -f`

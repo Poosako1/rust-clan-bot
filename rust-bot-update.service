@@ -1,0 +1,7 @@
+[Unit]
+Description=Check GitHub and update Rust clan bot
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/rust-clan-bot/autoupdate.sh
