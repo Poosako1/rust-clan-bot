@@ -302,6 +302,8 @@ async def bm_player_name(session, bm_id: int) -> str | None:
 def short_error(e: Exception) -> str:
     """Короткая причина сбоя для показа в чате."""
     if isinstance(e, aiohttp.ClientResponseError):
+        if e.status == 403:
+            return "BattleMetrics требует платную подписку на API (403)"
         return f"BattleMetrics ответил {e.status} {e.message}"[:120]
     return f"{type(e).__name__}: {e}"[:120]
 
@@ -558,12 +560,9 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
 
         await interaction.response.defer(ephemeral=True)
         async with aiohttp.ClientSession() as session:
-            name = await bm_player_name(session, bm_id)
+            name = await bm_player_name(session, bm_id)  # необязательно: API BattleMetrics может требовать подписку
         if name is None:
-            await interaction.followup.send(
-                "Профиль BattleMetrics не открылся (неверная ссылка или сайт недоступен). Проверь ссылку и попробуй ещё раз.",
-                ephemeral=True)
-            return
+            name = interaction.user.display_name
 
         try:
             res = await upsert_player(profile_payload(
@@ -576,7 +575,7 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
         how = {"discord": "обновил твою строку", "bm": "нашёл твою строку по ссылке BattleMetrics",
                "nick": "нашёл твою строку по нику", "new": "добавил новую строку"}.get(res.get("how"), "записал")
         await interaction.followup.send(
-            f"Готово, {how}. Ник в Rust: **{name}**, роль: {role}, регион: {self.region.value.strip()}, "
+            f"Готово, {how}. Ник: **{name}**, роль: {role}, регион: {self.region.value.strip()}, "
             f"выплаты: ••••{digits[-4:]}.", ephemeral=True)
 
 
