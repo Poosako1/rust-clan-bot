@@ -4,9 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 read -r -s -p "Ключ OpenRouter (при вводе не виден): " KEY; echo
-read -r -p "ID канала-редактора: " CH
+read -r -p "ID канала-редактора (Enter, если канал создан командой /setup_channels): " CH
 sed -i '/^OPENROUTER_KEY=/d;/^EDITOR_CHANNEL_ID=/d' .env
-printf 'OPENROUTER_KEY=%s\nEDITOR_CHANNEL_ID=%s\n' "$KEY" "$CH" >> .env
+printf 'OPENROUTER_KEY=%s\n' "$KEY" >> .env
+[ -n "$CH" ] && printf 'EDITOR_CHANNEL_ID=%s\n' "$CH" >> .env || true
 chmod 600 .env
 systemctl restart rust-bot
 sleep 4

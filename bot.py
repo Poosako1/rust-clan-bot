@@ -28,7 +28,6 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "").strip()          # клю�
 EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # канал-редактор
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
-USE_EDITOR = bool(OPENROUTER_KEY and EDITOR_CHANNEL_ID)
 # ================================
 
 API = "https://api.battlemetrics.com"
@@ -81,6 +80,7 @@ class Store:
         self.open_voice: dict[str, float] = {}
         self.heartbeat: float = time.time()
         self.wipes: dict[str, dict] = {}
+        self.cfg: dict = {}                 # настройки, созданные /setup_channels (роли и каналы)
         self.drafts: dict[str, dict] = {}   # id черновика -> {channel_id, text, author_id, ts}
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
@@ -93,6 +93,7 @@ class Store:
             self.checks = d.get("checks", {})
             self.statuses = d.get("statuses", {})
             self.drafts = d.get("drafts", {})
+            self.cfg = d.get("cfg", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -105,7 +106,7 @@ class Store:
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
                                    "checks": self.checks, "statuses": self.statuses,
-                                   "drafts": self.drafts}), encoding="utf-8")
+                                   "drafts": self.drafts, "cfg": self.cfg}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -152,6 +153,35 @@ class Store:
 
 
 store = Store()
+
+
+def cfg_id(key: str, env: int = 0) -> int:
+    return int(store.cfg.get(key) or env or 0)
+
+
+def report_channel_id() -> int:
+    return cfg_id("report", CHANNEL_ID)
+
+
+def editor_channel_id() -> int:
+    return cfg_id("editor", EDITOR_CHANNEL_ID)
+
+
+def staff_role_id() -> int:
+    return cfg_id("staff", STAFF_ROLE_ID)
+
+
+def use_editor() -> bool:
+    return bool(OPENROUTER_KEY and editor_channel_id())
+
+
+def is_staff_member(member) -> bool:
+    """Админ (право «Управлять сервером») или участник с ролью «Лидер»."""
+    perms = getattr(member, "guild_permissions", None)
+    if perms and perms.manage_guild:
+        return True
+    rid = staff_role_id()
+    return bool(rid and any(r.id == rid for r in getattr(member, "roles", [])))
 
 
 def active_status(uid: str, now: float | None = None) -> dict | None:
@@ -514,8 +544,8 @@ async def open_ticket(channel, info: dict, admin) -> None:
         for u in (member, admin):
             if u is not None:
                 ow[u] = see
-        if STAFF_ROLE_ID:
-            role = guild.get_role(STAFF_ROLE_ID)
+        if staff_role_id():
+            role = guild.get_role(staff_role_id())
             if role is not None:
                 ow[role] = see
         slug = re.sub(r"[^\w\-]+", "-", f"не-играл-{info['nick']}-{day}".lower()).strip("-")[:90]
@@ -523,7 +553,7 @@ async def open_ticket(channel, info: dict, admin) -> None:
                                                  reason=f"не играл {day}: {info['nick']}")
         info["ticket"] = ticket.id
         store.save()
-        staff = f"<@&{STAFF_ROLE_ID}> " if STAFF_ROLE_ID else ""
+        staff = f"<@&{staff_role_id()}> " if staff_role_id() else ""
         who = member.mention if member is not None else f"**{info['nick']}**"
         await ticket.send(f"{who} {staff}\nПочему {day} не играл?",
                           allowed_mentions=discord.AllowedMentions(users=True, roles=True))
@@ -545,7 +575,7 @@ async def apply_check_reaction(bot, payload, added: bool):
 
     if added:
         member = payload.member
-        if member is None or not member.guild_permissions.manage_guild:
+        if member is None or not is_staff_member(member):
             try:  # реакцию не админа убираем (нужно право «Управлять сообщениями», иначе просто игнорируем)
                 if partial is not None and member is not None:
                     await partial.remove_reaction(emoji, member)
@@ -695,7 +725,7 @@ async def apply_draft_reaction(bot, payload):
     if d is None or emoji not in DECISIONS or payload.user_id == bot.user.id:
         return
     member = payload.member
-    is_adm = bool(member and member.guild_permissions.manage_guild)
+    is_adm = bool(member and is_staff_member(member))
     if payload.user_id != d["author_id"] and not is_adm:
         return
     channel = bot.get_channel(payload.channel_id)
@@ -827,7 +857,7 @@ async def import_wipes_from_sheet():
             continue
         try:
             store.wipes[name] = {"name": name, "start": parse_dt(r[1]), "end": parse_dt(r[2]),
-                                 "status": status, "channel": CHANNEL_ID}
+                                 "status": status, "channel": report_channel_id()}
         except ValueError:
             print(f"вайп «{name}»: не разобрал даты {r[1]!r}, {r[2]!r}", flush=True)
     store.save()
@@ -835,8 +865,7 @@ async def import_wipes_from_sheet():
 
 # ---------- кнопки и формы ----------
 def is_admin(interaction: discord.Interaction) -> bool:
-    perms = getattr(interaction.user, "guild_permissions", None)
-    return bool(perms and perms.manage_guild)
+    return is_staff_member(interaction.user)
 
 
 ROLES = ["коллер", "комбат", "билдер", "фермер", "электрик"]
@@ -1056,13 +1085,6 @@ class StatusView(discord.ui.View):
     async def afk(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AfkModal())
 
-    @discord.ui.button(label="Кто играет", style=discord.ButtonStyle.primary, custom_id="status:who", row=1)
-    async def who(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Список видят только админы.", ephemeral=True)
-            return
-        await send_who_plays(interaction)
-
     @discord.ui.button(label="Я вернулся", style=discord.ButtonStyle.success, custom_id="status:back")
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = str(interaction.user.id)
@@ -1073,6 +1095,57 @@ class StatusView(discord.ui.View):
             await interaction.response.send_message("С возвращением! Статус снят.", ephemeral=True)
         else:
             await interaction.response.send_message("У тебя нет активного статуса.", ephemeral=True)
+
+
+async def send_status_list(interaction: discord.Interaction, kind: str):
+    """Список тех, кто сейчас в АФК или в инактиве."""
+    now = time.time()
+    rows = sorted((v for v in store.statuses.values() if v["kind"] == kind and v["until"] > now),
+                  key=lambda v: v["until"])
+    title = "В АФК" if kind == "афк" else "В инактиве"
+    if not rows:
+        await interaction.response.send_message(f"{title}: никого.")
+        return
+    lines = [f"**{title}: {len(rows)}**"]
+    for v in rows:
+        until = (f"{dt.datetime.fromtimestamp(v['until'], TZ):%H:%M}" if kind == "афк"
+                 else fmt_dt(v["until"])[:10])
+        lines.append(f"• {v['nick']} до {until}, {v['reason']}")
+    await interaction.response.send_message("\n".join(lines)[:1990], allowed_mentions=NO_PINGS)
+
+
+class AdminView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if not is_admin(interaction):
+            await interaction.response.send_message("Только для лидеров и админов.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Кто играет", style=discord.ButtonStyle.primary, custom_id="admin:who")
+    async def who(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await send_who_plays(interaction)
+
+    @discord.ui.button(label="Кто в АФК", style=discord.ButtonStyle.secondary, custom_id="admin:afk")
+    async def afk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await send_status_list(interaction, "афк")
+
+    @discord.ui.button(label="Кто в инактиве", style=discord.ButtonStyle.secondary, custom_id="admin:inactive")
+    async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await send_status_list(interaction, "инактив")
+
+    @discord.ui.button(label="Сводка сейчас", style=discord.ButtonStyle.danger, custom_id="admin:report")
+    async def report_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await interaction.response.defer(ephemeral=True)
+            await post_report(interaction.channel if interaction.channel_id == report_channel_id()
+                              else (interaction.client.get_channel(report_channel_id()) or interaction.channel))
+            await interaction.followup.send("Сводка выложена.", ephemeral=True)
 
 
 class PanelView(discord.ui.View):
@@ -1100,7 +1173,7 @@ class WipeView(discord.ui.View):
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()  # voice_states входит в default
-        if USE_EDITOR:
+        if OPENROUTER_KEY:
             intents.message_content = True  # нужно включить «Message Content Intent» в портале разработчика
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
@@ -1109,6 +1182,7 @@ class Bot(discord.Client):
         self.add_view(PanelView())
         self.add_view(WipeView())
         self.add_view(StatusView())
+        self.add_view(AdminView())
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -1132,7 +1206,7 @@ class Bot(discord.Client):
             store.voice_stop(uid)
 
     async def on_message(self, message):
-        if not USE_EDITOR or message.author.bot or message.channel.id != EDITOR_CHANNEL_ID:
+        if not use_editor() or message.author.bot or message.channel.id != editor_channel_id():
             return
         try:
             await handle_editor_message(self, message)
@@ -1141,7 +1215,7 @@ class Bot(discord.Client):
 
     async def on_raw_reaction_add(self, payload):
         await apply_check_reaction(self, payload, added=True)
-        if USE_EDITOR and payload.channel_id == EDITOR_CHANNEL_ID:
+        if use_editor() and payload.channel_id == editor_channel_id():
             await apply_draft_reaction(self, payload)
 
     async def on_raw_reaction_remove(self, payload):
@@ -1149,7 +1223,7 @@ class Bot(discord.Client):
 
     @tasks.loop(time=REPORT_TIME)
     async def daily_report(self):
-        channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
+        channel = self.get_channel(report_channel_id()) or await self.fetch_channel(report_channel_id())
         await post_report(channel)
 
     @tasks.loop(seconds=20)
@@ -1178,6 +1252,14 @@ async def admin_only(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("Только для админов.", ephemeral=True)
         return False
     return True
+
+
+TEXT_PROFILE = "Без заполнения в клан попасть нельзя."
+TEXT_WIPE = ("**Вайп**\nАдмин нажимает «Вайп» и указывает название, дату и время начала и конца. "
+             "В момент старта бот отметит, кто пришёл в голосовой канал и кто опоздал, "
+             "а по окончании выложит статистику: кто сколько наиграл.")
+TEXT_STATUS = "**Статус**\nНе можешь играть? Нажми инактив. Отошёл на время - нажми афк"
+TEXT_ADMIN = "**Админ-панель**\nКто сейчас должен играть, кто в АФК и кто в инактиве. Видно только лидерам."
 
 
 @bot.tree.command(name="panel", description="Выложить кнопку «Мой профиль» (для админов)")
@@ -1250,6 +1332,81 @@ async def who_plays(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await send_who_plays(interaction)
+
+
+STAFF_ROLE_NAME, CLAN_ROLE_NAME, CATEGORY_NAME = "Лидер", "Клан", "Клан"
+# ключ, название, кто видит (all / clan / staff), могут ли писать лидеры, панель
+CHANNEL_PLAN = [
+    ("profile", "анкета", "all", False, (TEXT_PROFILE, PanelView)),
+    ("report", "сводка", "staff", False, None),
+    ("wipe", "вайп", "clan", False, (TEXT_WIPE, WipeView)),
+    ("status", "статус", "clan", False, (TEXT_STATUS, StatusView)),
+    ("editor", "редактор", "staff", True, None),
+    ("admin", "админ-панель", "staff", False, (TEXT_ADMIN, AdminView)),
+]
+
+
+def channel_overwrites(guild, vis: str, staff_write: bool, staff, clan) -> dict:
+    P = discord.PermissionOverwrite
+    ow = {guild.me: P(view_channel=True, send_messages=True, embed_links=True, add_reactions=True,
+                      read_message_history=True, manage_messages=True, attach_files=True)}
+    if vis == "all":
+        ow[guild.default_role] = P(view_channel=True, send_messages=False, add_reactions=False,
+                                   read_message_history=True)
+    else:
+        ow[guild.default_role] = P(view_channel=False)
+        if vis == "clan":
+            ow[clan] = P(view_channel=True, send_messages=False, add_reactions=False, read_message_history=True)
+    ow[staff] = P(view_channel=True, send_messages=staff_write, add_reactions=True, read_message_history=True,
+                  attach_files=staff_write)
+    return ow
+
+
+async def setup_channels(guild) -> list[str]:
+    """Создать роли, закрытые каналы и панели. Ничего не дублирует при повторном запуске."""
+    notes = []
+    staff = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    if staff is None:
+        staff = await guild.create_role(name=STAFF_ROLE_NAME, reason="rust-clan-bot")
+        notes.append(f"создана роль «{STAFF_ROLE_NAME}»")
+    clan = discord.utils.get(guild.roles, name=CLAN_ROLE_NAME)
+    if clan is None:
+        clan = await guild.create_role(name=CLAN_ROLE_NAME, reason="rust-clan-bot")
+        notes.append(f"создана роль «{CLAN_ROLE_NAME}»")
+    store.cfg["staff"], store.cfg["member"] = staff.id, clan.id
+    category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(CATEGORY_NAME, reason="rust-clan-bot")
+    for key, name, vis, staff_write, panel in CHANNEL_PLAN:
+        ch = discord.utils.get(guild.text_channels, name=name, category=category)
+        if ch is None:
+            ch = await guild.create_text_channel(name, category=category, reason="rust-clan-bot",
+                                                 overwrites=channel_overwrites(guild, vis, staff_write, staff, clan))
+            notes.append(f"создан канал #{name} ({'видят все, писать нельзя' if vis == 'all' else 'приватный'})")
+            if panel:
+                await ch.send(panel[0], view=panel[1]())
+        store.cfg[key] = ch.id
+    store.save()
+    return notes
+
+
+@bot.tree.command(name="setup_channels", description="Создать закрытые каналы, роли и панели (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def setup_channels_cmd(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        notes = await setup_channels(interaction.guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не получилось: {short_error(e)}. Дай боту права «Управлять каналами» и «Управлять ролями».",
+            ephemeral=True)
+        return
+    lines = ["Готово." if notes else "Всё уже создано, ничего не менял."] + [f"• {n}" for n in notes]
+    lines.append(f"Выдай игрокам роль «{CLAN_ROLE_NAME}», лидерам роль «{STAFF_ROLE_NAME}». "
+                 "Сводка теперь выкладывается в #сводка.")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
