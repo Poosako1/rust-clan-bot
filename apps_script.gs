@@ -1,7 +1,7 @@
 // Скрипт для Google-таблицы «клан»: Расширения -> Apps Script -> вставить -> Развернуть как веб-приложение.
 // SECRET замени на тот же секрет, который вписан в .env бота (SCRIPT_SECRET).
 const SECRET = 'ПОМЕНЯЙ_СЕКРЕТ';
-const PLAYERS = 'общее';       // Никнейм | роль | зарплата | банк | батлметрикс | Discord ID | Steam | Регион
+const PLAYERS = 'общее';       // Никнейм | роль | зарплата | банк | батлметрикс | Discord ID | Steam | Регион | Discord
 const WIPES = 'вайп';          // Вайп | Начало (МСК) | Конец (МСК) | Статус
 const RESULTS = 'итоги вайпа'; // Вайп | Ник | Discord ID | Явка | Опоздание, мин | Гс, ч | Rust, ч
 
@@ -36,9 +36,11 @@ function doPost(e) {
     }
 
     if (d.action === 'player_upsert') {
+      // p.cells: {номер столбца: значение} пишется всегда; p.if_empty: пишется, только если ячейка пуста.
+      // Строка ищется по Discord ID (столбец F), затем по ссылке BM (E), затем по нику (A).
       const p = d.p;
       const sh = tab_(PLAYERS);
-      const rows = rows_(sh, 8);
+      const rows = rows_(sh, 9);
       let idx = -1, how = 'new';
       for (let i = 0; i < rows.length; i++) { if (rows[i][5] === p.discord) { idx = i; how = 'discord'; break; } }
       if (idx < 0) {
@@ -46,18 +48,33 @@ function doPost(e) {
           if (rows[i][4].indexOf('players/' + p.bm_id) >= 0) { idx = i; how = 'bm'; break; }
         }
       }
-      if (idx < 0) {
+      if (idx < 0 && p.nick) {
         for (let i = 0; i < rows.length; i++) {
           if (norm_(rows[i][0]) === norm_(p.nick)) { idx = i; how = 'nick'; break; }
         }
       }
-      const r = idx >= 0 ? idx + 2 : Math.max(sh.getLastRow(), 1) + 1;
-      sh.getRange(r, 6).setNumberFormat('@').setValue(p.discord);          // Discord ID
-      sh.getRange(r, 5).setValue(p.bm_url);                                 // батлметрикс
-      sh.getRange(r, 7).setValue(p.steam);                                  // Steam
-      sh.getRange(r, 8).setValue(p.region);                                 // Регион
-      sh.getRange(r, 4).setNumberFormat('@').setValue(p.card);              // банк
-      if (idx < 0 || !String(sh.getRange(r, 1).getValue()).trim()) sh.getRange(r, 1).setValue(p.nick);
+      let r;
+      if (idx >= 0) {
+        r = idx + 2;
+      } else {
+        // новая строка: вставить в конец блока своей роли (порядок: коллер, комбат, билдер, фермер, электрик)
+        const order = ['коллер', 'комбат', 'билдер', 'фермер', 'электрик'];
+        const rank = function (x) { const k = order.indexOf(norm_(x)); return k < 0 ? 99 : k; };
+        const mine = rank(p.role);
+        let pos = rows.length;
+        for (let i = 0; i < rows.length; i++) { if (rank(rows[i][1]) > mine) { pos = i; break; } }
+        if (pos < rows.length) { sh.insertRowBefore(pos + 2); r = pos + 2; }
+        else { r = Math.max(sh.getLastRow(), 1) + 1; }
+      }
+      const cells = p.cells || {};
+      Object.keys(cells).forEach(function (c) {
+        sh.getRange(r, Number(c)).setNumberFormat('@').setValue(String(cells[c]));
+      });
+      const ifEmpty = p.if_empty || {};
+      Object.keys(ifEmpty).forEach(function (c) {
+        const cell = sh.getRange(r, Number(c));
+        if (!String(cell.getValue()).trim()) cell.setNumberFormat('@').setValue(String(ifEmpty[c]));
+      });
       return out_({ ok: true, how: how, row: r });
     }
 

@@ -3,6 +3,7 @@ import re
 import json
 import time
 import asyncio
+import difflib
 import datetime as dt
 from pathlib import Path
 
@@ -394,15 +395,39 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return bool(perms and perms.manage_guild)
 
 
+ROLES = ["коллер", "комбат", "билдер", "фермер", "электрик"]
+
+
+def normalize_role(text: str) -> str | None:
+    t = text.strip().lower().replace("ё", "е")
+    if len(t) < 3:
+        return None
+    for r in ROLES:
+        if r.startswith(t) or t.startswith(r[:4]):
+            return r
+    close = difflib.get_close_matches(t, ROLES, n=1, cutoff=0.7)  # опечатки вроде «колер», «билдр»
+    return close[0] if close else None
+
+
+def profile_payload(uid: str, discord_name: str, bm_id: int, bm_name: str,
+                    steam: str, region: str, role: str, payout: str) -> dict:
+    """Что записать в таблицу. Ключи cells — номера столбцов листа «общее»."""
+    return {"discord": uid, "bm_id": bm_id, "nick": bm_name, "role": role,
+            "cells": {"2": role, "4": payout, "5": f"https://www.battlemetrics.com/players/{bm_id}",
+                      "6": uid, "7": steam, "8": region, "9": discord_name},
+            "if_empty": {"1": bm_name}}
+
+
 class ProfileModal(discord.ui.Modal, title="Мой профиль"):
-    nick = discord.ui.TextInput(label="Ник в игре", placeholder="Как записан в таблице клана", max_length=60)
     steam = discord.ui.TextInput(
         label="Ваш Steam ID", placeholder="76561198000000000 или ссылка на профиль Steam", max_length=200)
     bm = discord.ui.TextInput(
         label="Ваш BattleMetrics", placeholder="https://www.battlemetrics.com/players/123456789", max_length=200)
     region = discord.ui.TextInput(label="Регион", placeholder="Например: UA, EU, Москва", max_length=60)
-    card = discord.ui.TextInput(
-        label="Карта для выплат (только номер)", placeholder="Без срока и CVV", max_length=30)
+    role = discord.ui.TextInput(
+        label="Твоя роль в клане", placeholder="коллер, комбат, билдер, фермер или электрик", max_length=30)
+    payout = discord.ui.TextInput(
+        label="Карта или номер для выплат", placeholder="Номер карты или телефона и банк", max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw_steam = self.steam.value.strip()
@@ -425,12 +450,23 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
         bm_id = int(m.group(1))
 
-        digits = re.sub(r"\D", "", self.card.value)
-        if not (13 <= len(digits) <= 19) or not luhn_ok(digits):
+        role = normalize_role(self.role.value)
+        if role is None:
             await interaction.response.send_message(
-                "Номер карты не прошёл проверку. Введи только номер (13-19 цифр), без срока и CVV.", ephemeral=True)
+                "Роль не распознана. Напиши одну из: " + ", ".join(ROLES) + ".", ephemeral=True)
             return
-        card = " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+        payout = self.payout.value.strip()
+        digits = re.sub(r"\D", "", payout)
+        if len(digits) < 10:
+            await interaction.response.send_message(
+                "Нужен номер карты или телефона (минимум 10 цифр) и банк.", ephemeral=True)
+            return
+        if 13 <= len(digits) <= 19 and not luhn_ok(digits):
+            await interaction.response.send_message(
+                "Номер карты не прошёл проверку, возможно опечатка. Проверь цифры и попробуй ещё раз. "
+                "Срок и CVV не нужны.", ephemeral=True)
+            return
 
         await interaction.response.defer(ephemeral=True)
         async with aiohttp.ClientSession() as session:
@@ -442,10 +478,9 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
 
         try:
-            res = await sheet_call({"action": "player_upsert", "p": {
-                "discord": str(interaction.user.id), "nick": self.nick.value.strip(), "steam": steam,
-                "bm_id": bm_id, "bm_url": f"https://www.battlemetrics.com/players/{bm_id}",
-                "region": self.region.value.strip(), "card": card}})
+            res = await sheet_call({"action": "player_upsert", "p": profile_payload(
+                str(interaction.user.id), interaction.user.name, bm_id, name,
+                steam, self.region.value.strip(), role, payout)})
         except Exception as e:
             print(f"Ошибка записи в таблицу: {e}")
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
@@ -453,8 +488,8 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
         how = {"discord": "обновил твою строку", "bm": "нашёл твою строку по ссылке BattleMetrics",
                "nick": "нашёл твою строку по нику", "new": "добавил новую строку"}.get(res.get("how"), "записал")
         await interaction.followup.send(
-            f"Готово, {how}. Ник в Rust: **{name}**, регион: {self.region.value.strip()}, карта •••• {digits[-4:]}.",
-            ephemeral=True)
+            f"Готово, {how}. Ник в Rust: **{name}**, роль: {role}, регион: {self.region.value.strip()}, "
+            f"выплаты: ••••{digits[-4:]}.", ephemeral=True)
 
 
 class WipeModal(discord.ui.Modal, title="Новый вайп"):
@@ -596,8 +631,8 @@ async def panel(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await interaction.channel.send(
-        "**Клановая панель**\nНажми «Мой профиль» и заполни: ник, Steam ID, ссылку на BattleMetrics, регион и карту "
-        "для выплат. Данные попадают в клановую таблицу.",
+        "**Анкета клана**\nБез заполнения в клан попасть нельзя. "
+        "Нажми кнопку ниже и заполни: Steam ID, BattleMetrics, регион, свою роль в клане и карту или номер для выплат.",
         view=PanelView(),
     )
     await interaction.response.send_message("Панель выложена.", ephemeral=True)
