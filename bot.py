@@ -8,7 +8,6 @@ from pathlib import Path
 
 import aiohttp
 import discord
-import gspread
 from discord import app_commands
 from discord.ext import tasks
 
@@ -19,9 +18,8 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])                  # канал для 
 MIN_HOURS = float(os.environ.get("MIN_HOURS", "8"))         # норма часов (и в гс, и в Rust)
 WINDOW_HOURS = float(os.environ.get("WINDOW_HOURS", "24"))  # за какой период считать (24 = сутки, 168 = неделя)
 REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколько слать сводку, UTC (09:00 UTC = 12:00 МСК)
-SHEET_ID = os.environ["SHEET_ID"]                           # ID Google-таблицы (из ссылки между /d/ и /edit)
-SHEET_TAB = os.environ.get("SHEET_TAB", "Профили")          # вкладка, создастся сама
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "google.json")  # json сервисного аккаунта
+SCRIPT_URL = os.environ["SCRIPT_URL"]                       # адрес веб-приложения Google Apps Script из таблицы
+SCRIPT_SECRET = os.environ["SCRIPT_SECRET"]                 # секрет, такой же как в скрипте таблицы
 SERVER_IDS = {s.strip() for s in os.environ.get("SERVER_IDS", "").split(",") if s.strip()}  # пусто = все сервера
 # ================================
 
@@ -48,47 +46,33 @@ def luhn_ok(num: str) -> bool:
     return total % 10 == 0
 
 
-# ---------- таблица (профили) ----------
-HEADERS = ["Discord ID", "Discord", "Steam", "BattleMetrics", "Регион", "Карта", "Обновлено"]
+# ---------- таблица (профили) через Google Apps Script ----------
+async def sheet_call(payload: dict) -> dict:
+    payload = {**payload, "secret": SCRIPT_SECRET}
+    timeout = aiohttp.ClientTimeout(total=40)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(SCRIPT_URL, json=payload) as r:  # Google отвечает редиректом, aiohttp идёт за ним
+            r.raise_for_status()
+            data = await r.json(content_type=None)
+    if not data.get("ok"):
+        raise RuntimeError(f"таблица: {data.get('error')}")
+    return data
 
 
-class Sheet:
-    """Профили лежат в Google-таблице: одна строка на игрока, ключ — Discord ID (колонка A)."""
-
-    def __init__(self):
-        cred = Path(GOOGLE_CREDENTIALS)
-        if not cred.is_absolute():
-            cred = BASE / cred
-        gc = gspread.service_account(filename=str(cred))
-        sh = gc.open_by_key(SHEET_ID)
-        try:
-            self.ws = sh.worksheet(SHEET_TAB)
-        except gspread.WorksheetNotFound:
-            self.ws = sh.add_worksheet(SHEET_TAB, rows=500, cols=len(HEADERS))
-        if self.ws.row_values(1)[:len(HEADERS)] != HEADERS:
-            self.ws.update(values=[HEADERS], range_name="A1")
-
-    def upsert(self, uid: str, name: str, steam: str, bm_id: int, region: str, card: str):
-        row = [uid, name, steam, f"https://www.battlemetrics.com/players/{bm_id}", region, card,
-               dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")]
-        ids = self.ws.col_values(1)
-        if uid in ids:
-            n = ids.index(uid) + 1
-            self.ws.update(values=[row], range_name=f"A{n}:G{n}")
-        else:
-            self.ws.append_row(row)
-
-    def all_profiles(self) -> dict[str, dict]:
-        out = {}
-        for r in self.ws.get_all_values()[1:]:
-            r = r + [""] * (len(HEADERS) - len(r))
-            m = re.search(r"players/(\d+)", r[3])
-            if r[0] and m:
-                out[r[0]] = {"name": r[1], "steam": r[2], "bm": int(m.group(1)), "region": r[4], "card": r[5]}
-        return out
+async def sheet_upsert(uid: str, name: str, steam: str, bm_id: int, region: str, card: str):
+    row = [uid, name, steam, f"https://www.battlemetrics.com/players/{bm_id}", region, card,
+           dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")]
+    await sheet_call({"action": "upsert", "row": row})
 
 
-sheet = Sheet()
+async def sheet_profiles() -> dict[str, dict]:
+    out = {}
+    for r in (await sheet_call({"action": "list"}))["rows"]:
+        r = list(r) + [""] * (7 - len(r))
+        m = re.search(r"players/(\d+)", r[3])
+        if r[0] and m:
+            out[r[0]] = {"name": r[1], "steam": r[2], "bm": int(m.group(1)), "region": r[4], "card": r[5]}
+    return out
 
 
 # ---------- учёт времени в гс (локально) ----------
@@ -187,7 +171,7 @@ async def bm_player_name(session, bm_id: int) -> str | None:
 
 # ---------- сводка ----------
 async def build_report() -> list[str]:
-    profiles = await asyncio.to_thread(sheet.all_profiles)
+    profiles = await sheet_profiles()
     if not profiles:
         return ["В таблице нет заполненных профилей. Админ может выложить кнопку командой `/panel`."]
 
@@ -293,8 +277,8 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
 
         try:
-            await asyncio.to_thread(sheet.upsert, str(interaction.user.id), str(interaction.user),
-                                    steam, bm_id, self.region.value.strip(), card)
+            await sheet_upsert(str(interaction.user.id), str(interaction.user),
+                               steam, bm_id, self.region.value.strip(), card)
         except Exception as e:
             print(f"Ошибка записи в таблицу: {e}")
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)

@@ -4,4 +4,3 @@ __pycache__/
 *.pyc
 data.json
 data.tmp
-google.json
