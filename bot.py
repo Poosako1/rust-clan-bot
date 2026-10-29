@@ -495,6 +495,14 @@ async def apply_check_reaction(bot, payload, added: bool):
             await partial.edit(content=text, allowed_mentions=NO_PINGS)
         except Exception as e:
             print(f"Не удалось обновить сообщение: {short_error(e)}", flush=True)
+    # все игроки этой сводки отмечены -> подтверждение
+    if decision and channel is not None:
+        same = [v for v in store.checks.values() if v["rid"] == info["rid"]]
+        if all(v["decision"] for v in same):
+            try:
+                await channel.send(f"✅ Записано успешно: отмечены все ({len(same)}).")
+            except Exception as e:
+                print(f"Не удалось отправить подтверждение: {short_error(e)}", flush=True)
 
 
 # ---------- вайп ----------
