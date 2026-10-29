@@ -28,6 +28,7 @@ WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # скольк�
 
 API = "https://api.battlemetrics.com"
 BM_HEADERS = {"Authorization": f"Bearer {BM_TOKEN}"} if BM_TOKEN else {}
+USE_BM = bool(BM_TOKEN)  # API BattleMetrics требует платную подписку; без токена проверка идёт только по гс
 BASE = Path(__file__).parent
 DATA_FILE = BASE / "data.json"
 KEEP_DAYS = 45
@@ -149,7 +150,7 @@ async def sheet_call(payload: dict) -> dict:
     return data
 
 
-SHEET_PLAYERS, SHEET_WIPES, SHEET_RESULTS = "общее", "вайп", "итоги вайпа"
+SHEET_PLAYERS, SHEET_WIPES, SHEET_RESULTS, SHEET_CHECKS = "общее", "вайп", "итоги вайпа", "проверки"
 PLAYER_COLS = 9  # Никнейм | роль | зарплата | банк | батлметрикс | Discord ID | Steam | Регион | Discord
 
 
@@ -246,6 +247,28 @@ async def sheet_results_write(wipe: str, results: list[list]):
         await sheet_call({"ops": ops})
 
 
+async def sheet_checks_add(label: str, entries: list[tuple[str, str, float]]):
+    """Записать в лист «проверки» строки отчёта (решение пока пустое)."""
+    rows = await sheet_get(SHEET_CHECKS)
+    start = max(len(rows), 1) + 1
+    values = [[label, nick, uid, f"{voice:.1f}", "", "", ""] for uid, nick, voice in entries]
+    await sheet_call({"ops": [{"op": "set", "sheet": SHEET_CHECKS, "row": start, "col": 1, "text": True,
+                               "values": values}]})
+
+
+async def sheet_check_set(label: str, uid: str, nick: str, decision: str, by: str):
+    rows = await sheet_get(SHEET_CHECKS)
+    row_no = next((i + 1 for i, r in enumerate(rows) if i > 0 and len(r) > 2 and r[0] == label and r[2] == uid), None)
+    ops = []
+    if row_no is None:
+        row_no = max(len(rows), 1) + 1
+        ops.append({"op": "set", "sheet": SHEET_CHECKS, "row": row_no, "col": 1, "text": True,
+                    "values": [[label, nick, uid, ""]]})
+    ops.append({"op": "set", "sheet": SHEET_CHECKS, "row": row_no, "col": 5, "text": True,
+                "values": [[decision, by, fmt_dt(time.time())]]})
+    await sheet_call({"ops": ops})
+
+
 # ---------- BattleMetrics ----------
 def parse_ts(s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -321,10 +344,11 @@ def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
 
 
 # ---------- ежедневная сводка ----------
-async def build_report() -> list[str]:
+async def compute_report() -> dict:
+    """Кто не набрал норму. -> {"empty": str|None, "lazy": [...], "ok": int, "failed": [...], "period": str}"""
     profiles = await sheet_players()
     if not profiles:
-        return ["В таблице нет игроков с привязанным Discord. Админ может выложить кнопку командой `/panel`."]
+        return {"empty": "В таблице нет игроков с привязанным Discord. Админ может выложить кнопку командой `/panel`."}
 
     now_dt = dt.datetime.now(dt.timezone.utc)
     since_dt = now_dt - dt.timedelta(hours=WINDOW_HOURS)
@@ -333,49 +357,166 @@ async def build_report() -> list[str]:
     lazy, ok, failed = [], 0, []
     async with aiohttp.ClientSession() as session:
         for uid, p in profiles.items():
-            # шаг 1: гс. Набрал норму — BattleMetrics не трогаем
+            # шаг 1: гс. Набрал норму, всё в порядке
             voice = store.voice_hours(uid, since, now)
             if voice >= MIN_HOURS:
                 ok += 1
                 continue
-            # шаг 2: в гс мало — смотрим Rust в BattleMetrics
-            if p["bm"] is None:
-                failed.append((uid, "нет ссылки BattleMetrics в таблице"))
-                continue
-            try:
-                rust = await rust_hours(session, p["bm"], since_dt, now_dt)
-            except Exception as e:
-                print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
-                failed.append((uid, short_error(e)))
-                continue
-            if rust >= MIN_HOURS:
-                ok += 1
-            else:
-                lazy.append((uid, p, voice, rust))
+            rust = None
+            if USE_BM:  # шаг 2 (только с токеном BattleMetrics): в гс мало, смотрим Rust
+                if p["bm"] is None:
+                    failed.append((uid, p["nick"], "нет ссылки BattleMetrics в таблице"))
+                    continue
+                try:
+                    rust = await rust_hours(session, p["bm"], since_dt, now_dt)
+                except Exception as e:
+                    print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
+                    failed.append((uid, p["nick"], short_error(e)))
+                    continue
+                if rust >= MIN_HOURS:
+                    ok += 1
+                    continue
+            lazy.append({"uid": uid, "nick": p["nick"], "bm": p["bm"], "voice": voice, "rust": rust})
+    lazy.sort(key=lambda x: (x["rust"] if x["rust"] is not None else 0, x["voice"]))
+    return {"empty": None, "lazy": lazy, "ok": ok, "failed": failed, "period": f"{WINDOW_HOURS:g} ч"}
 
-    period = f"{WINDOW_HOURS:g} ч"
+
+def lazy_line(x: dict) -> str:
+    link = f"<https://www.battlemetrics.com/players/{x['bm']}>" if x["bm"] else "ссылки BattleMetrics нет"
+    hours = f"гс {x['voice']:.1f} ч" + (f", Rust {x['rust']:.1f} ч" if x["rust"] is not None else "")
+    return f"• {x['nick']} — {hours} — {link}"
+
+
+def report_header(data: dict) -> str:
+    if data["lazy"]:
+        if USE_BM:
+            return f"⚠️ Не набрали {MIN_HOURS:g} ч ни в гс, ни в Rust за последние {data['period']}:"
+        return f"⚠️ Меньше {MIN_HOURS:g} ч в гс за последние {data['period']}:"
+    if data["ok"]:
+        return f"✅ За последние {data['period']} все проверенные выполнили норму ({MIN_HOURS:g} ч): {data['ok']}."
+    return f"Проверить не удалось никого, нормы за последние {data['period']} неизвестны."
+
+
+def report_tail(data: dict) -> list[str]:
     lines = []
-    if lazy:
-        lazy.sort(key=lambda x: (x[3], x[2]))
-        lines.append(f"⚠️ Не набрали {MIN_HOURS:g} ч ни в гс, ни в Rust за последние {period}:")
-        for uid, p, voice, rust in lazy:
-            extra = [p["role"]] if p["role"] else []
-            if p["region"]:
-                extra.append(p["region"])
-            extra.append(f"[BM](<https://www.battlemetrics.com/players/{p['bm']}>)")
-            lines.append(f"• <@{uid}> ({p['nick']}) — гс {voice:.1f} ч, Rust {rust:.1f} ч · " + " · ".join(extra))
-    elif ok:
-        lines.append(f"✅ За последние {period} все проверенные выполнили норму ({MIN_HOURS:g} ч): {ok}.")
-    else:
-        lines.append(f"Проверить не удалось никого, нормы за последние {period} неизвестны.")
-    if ok and lazy:
-        lines.append(f"Выполнили норму: {ok}")
-    if failed:
+    if data["ok"] and data["lazy"]:
+        lines.append(f"Выполнили норму: {data['ok']}")
+    if data["failed"]:
         lines.append("Не удалось проверить:")
-        for uid, reason in failed:
-            nick = profiles[uid]["nick"]
-            lines.append(f"• <@{uid}> ({nick}): {reason}")
-    return chunk_lines(lines)
+        lines += [f"• {nick}: {reason}" for _, nick, reason in data["failed"]]
+    return lines
+
+
+async def build_report() -> list[str]:
+    """Сводка просто текстом (без кнопок)."""
+    data = await compute_report()
+    if data["empty"]:
+        return [data["empty"]]
+    return chunk_lines([report_header(data)] + [lazy_line(x) for x in data["lazy"]] + report_tail(data))
+
+
+# ---------- кнопки «играл 8ч / не играл 8ч» под сводкой ----------
+DECISIONS = {"yes": "играл 8ч", "no": "не играл 8ч"}
+ROWS_PER_MESSAGE = 5  # у Discord максимум 5 рядов кнопок на сообщение: один игрок на ряд
+
+
+class CheckButton(discord.ui.DynamicItem[discord.ui.Button],
+                  template=r"chk:(?P<v>yes|no):(?P<rid>\d+):(?P<uid>\d+)"):
+    """Постоянная кнопка: custom_id хранит решение, номер отчёта и Discord ID игрока."""
+
+    def __init__(self, v: str, rid: int, uid: str, row: int, *, chosen: bool = False):
+        style = (discord.ButtonStyle.success if v == "yes" else discord.ButtonStyle.danger) if chosen \
+            else discord.ButtonStyle.secondary
+        button = discord.ui.Button(label=("✅ " if v == "yes" else "❌ ") + DECISIONS[v], style=style,
+                                   custom_id=f"chk:{v}:{rid}:{uid}", disabled=chosen, row=row)
+        super().__init__(button)
+        self.v, self.rid, self.uid = v, rid, uid
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(match["v"], int(match["rid"]), match["uid"], row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Отмечать могут только админы.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        nick = nick_from_message(interaction.message, self.uid)
+        try:
+            await sheet_check_set(fmt_dt(self.rid), self.uid, nick, DECISIONS[self.v], interaction.user.name)
+        except Exception as e:
+            print(f"Ошибка записи решения: {short_error(e)}", flush=True)
+            await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
+            return
+        await interaction.edit_original_response(view=rebuild_view(interaction.message, self.uid, self.v))
+
+
+def nick_from_message(message: discord.Message, uid: str) -> str:
+    for row in message.components:
+        kids = getattr(row, "children", [])
+        if len(kids) == 3 and kids[1].custom_id.endswith(f":{uid}"):
+            return kids[0].label.split(" — ")[0]
+    return ""
+
+
+def player_row(i: int, nick: str, rid: int, uid: str, decision: str | None) -> list[discord.ui.Item]:
+    label = f"{nick[:50]} — {'✅' if decision == 'yes' else '❌'} {DECISIONS[decision]}" if decision else nick[:70]
+    name = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True,
+                             custom_id=f"chk:name:{rid}:{uid}", row=i)
+    return [name, CheckButton("yes", rid, uid, i, chosen=decision == "yes"),
+            CheckButton("no", rid, uid, i, chosen=decision == "no")]
+
+
+def rebuild_view(message: discord.Message, pressed_uid: str, decision: str) -> discord.ui.View:
+    """Собрать кнопки заново: у нажатого игрока выбранное решение подсвечено, остальные ряды как были."""
+    view = discord.ui.View(timeout=None)
+    for i, row in enumerate(message.components):
+        kids = getattr(row, "children", [])
+        if len(kids) != 3:
+            continue
+        uid = kids[1].custom_id.rsplit(":", 1)[1]
+        rid = int(kids[1].custom_id.split(":")[2])
+        nick = kids[0].label.split(" — ")[0]
+        if uid == pressed_uid:
+            state = decision
+        else:
+            state = "yes" if kids[1].disabled else ("no" if kids[2].disabled else None)
+        for item in player_row(i, nick, rid, uid, state):
+            view.add_item(item)
+    return view
+
+
+async def post_report(channel: discord.abc.Messageable):
+    """Выложить сводку: ник, ссылка BM и две кнопки рядом с каждым игроком."""
+    data = await compute_report()
+    if data["empty"]:
+        await channel.send(data["empty"], allowed_mentions=NO_PINGS)
+        return
+    lazy = data["lazy"]
+    if not lazy:
+        for chunk in chunk_lines([report_header(data)] + report_tail(data)):
+            await channel.send(chunk, allowed_mentions=NO_PINGS)
+        return
+
+    rid = int(time.time())
+    warn = ""
+    try:
+        await sheet_checks_add(fmt_dt(rid), [(x["uid"], x["nick"], x["voice"]) for x in lazy])
+    except Exception as e:
+        print(f"Ошибка записи в лист проверок: {short_error(e)}", flush=True)
+        warn = "\n⚠️ Не удалось записать в лист «проверки», решения могут не сохраниться."
+    for k in range(0, len(lazy), ROWS_PER_MESSAGE):
+        group = lazy[k:k + ROWS_PER_MESSAGE]
+        lines = ([report_header(data)] if k == 0 else []) + [lazy_line(x) for x in group]
+        view = discord.ui.View(timeout=None)
+        for i, x in enumerate(group):
+            for item in player_row(i, x["nick"], rid, x["uid"], None):
+                view.add_item(item)
+        await channel.send("\n".join(lines) + (warn if k == 0 else ""), view=view, allowed_mentions=NO_PINGS)
+    tail = report_tail(data)
+    if tail:
+        for chunk in chunk_lines(tail):
+            await channel.send(chunk, allowed_mentions=NO_PINGS)
 
 
 # ---------- вайп ----------
@@ -429,34 +570,35 @@ async def finish_wipe(bot, w: dict):
 
 
 async def _finish_wipe(channel, w: dict):
-    await channel.send(f"🔴 **{w['name']}** завершён. Считаю итоги, это займёт несколько минут...")
+    await channel.send(f"🔴 **{w['name']}** завершён. Считаю итоги...")
     profiles = await sheet_players()
     now = time.time()
     since_dt = dt.datetime.fromtimestamp(w["start"], dt.timezone.utc)
     end_dt = dt.datetime.fromtimestamp(w["end"], dt.timezone.utc)
 
     rust: dict[str, float | str] = {}
-    async with aiohttp.ClientSession() as session:
-        for uid, p in profiles.items():
-            if p["bm"] is None:
-                rust[uid] = ""
-                continue
-            try:
-                rust[uid] = round(await rust_hours(session, p["bm"], since_dt, end_dt), 1)
-            except Exception as e:
-                print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
-                rust[uid] = ""
+    if USE_BM:  # часы в Rust только если есть токен BattleMetrics
+        async with aiohttp.ClientSession() as session:
+            for uid, p in profiles.items():
+                if p["bm"] is None:
+                    rust[uid] = ""
+                    continue
+                try:
+                    rust[uid] = round(await rust_hours(session, p["bm"], since_dt, end_dt), 1)
+                except Exception as e:
+                    print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
+                    rust[uid] = ""
 
     rows = await attendance_rows(w, profiles, final=True, now=now, with_rust=rust)
-    rows.sort(key=lambda r: (r[6] if isinstance(r[6], (int, float)) else -1), reverse=True)
+    rows.sort(key=lambda r: ((r[6] if isinstance(r[6], (int, float)) else -1), r[5]), reverse=True)
     await sheet_results_write(w["name"], rows)
     await sheet_wipe_status(w, "завершён")
 
     lines = [f"📊 **Итоги {w['name']}** ({fmt_dt(w['start'])} — {fmt_dt(w['end'])})"]
     for _, nick, uid, label, late, voice, r in rows:
-        rust_txt = f"{r:.1f} ч" if isinstance(r, (int, float)) else "нет данных"
+        rust_txt = (f"Rust {r:.1f} ч, " if isinstance(r, (int, float)) else ("Rust нет данных, " if USE_BM else ""))
         late_txt = f" {late} мин" if label == "опоздал" else ""
-        lines.append(f"• <@{uid}> ({nick}) — Rust {rust_txt}, гс {voice:.1f} ч, {label}{late_txt}")
+        lines.append(f"• {nick} — {rust_txt}гс {voice:.1f} ч, {label}{late_txt}")
     late_n = sum(1 for r in rows if r[3] == "опоздал")
     miss_n = sum(1 for r in rows if r[3] == "не явился")
     lines.append(f"Опоздали: {late_n}, не явились: {miss_n}, всего игроков: {len(rows)}.")
@@ -656,6 +798,7 @@ class Bot(discord.Client):
     async def setup_hook(self):
         self.add_view(PanelView())
         self.add_view(WipeView())
+        self.add_dynamic_items(CheckButton)
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -681,8 +824,7 @@ class Bot(discord.Client):
     @tasks.loop(time=REPORT_TIME)
     async def daily_report(self):
         channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
-        for chunk in await build_report():
-            await channel.send(chunk, allowed_mentions=NO_PINGS)
+        await post_report(channel)
 
     @tasks.loop(seconds=20)
     async def wipe_tick(self):
@@ -761,14 +903,14 @@ async def wipe_status(interaction: discord.Interaction):
         await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
 
 
-@bot.tree.command(name="report", description="Запустить проверку нормы прямо сейчас (для админов)")
+@bot.tree.command(name="report", description="Выложить сводку по норме прямо сейчас (для админов)")
 @app_commands.default_permissions(manage_guild=True)
 async def report(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await interaction.response.defer(ephemeral=True)
-    for chunk in await build_report():
-        await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
+    await post_report(interaction.channel)
+    await interaction.followup.send("Сводка выложена.", ephemeral=True)
 
 
 bot.run(DISCORD_TOKEN)
