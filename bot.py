@@ -708,8 +708,7 @@ async def panel(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await interaction.channel.send(
-        "**Анкета клана**\nБез заполнения в клан попасть нельзя. "
-        "Нажми кнопку ниже и заполни: Steam ID, BattleMetrics, регион, свою роль в клане и карту или номер для выплат.",
+        "Без заполнения в клан попасть нельзя.",
         view=PanelView(),
     )
     await interaction.response.send_message("Панель выложена.", ephemeral=True)
