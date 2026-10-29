@@ -461,7 +461,7 @@ async def post_report(channel: discord.abc.Messageable):
 
 
 async def open_ticket(channel, info: dict, admin) -> None:
-    """❌ «не играл»: приватная ветка с игроком, бот задаёт один вопрос, дальше общаются с стаффом."""
+    """❌ «не играл»: приватный канал с игроком и стаффом, бот задаёт один вопрос."""
     if info.get("ticket"):
         return
     guild = getattr(channel, "guild", None)
@@ -473,23 +473,30 @@ async def open_ticket(channel, info: dict, admin) -> None:
             member = None
     day = info.get("day") or dt.datetime.fromtimestamp(info["rid"] - WINDOW_HOURS * 3600, TZ).strftime("%d.%m")
     try:
-        thread = await channel.create_thread(name=f"не играл {day} — {info['nick']}"[:100],
-                                             type=discord.ChannelType.private_thread, invitable=False)
-        info["ticket"] = thread.id
-        store.save()
+        see = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                          attach_files=True)
+        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: see}
         for u in (member, admin):
             if u is not None:
-                await thread.add_user(u)
+                ow[u] = see
+        if STAFF_ROLE_ID:
+            role = guild.get_role(STAFF_ROLE_ID)
+            if role is not None:
+                ow[role] = see
+        slug = re.sub(r"[^\w\-]+", "-", f"не-играл-{info['nick']}-{day}".lower()).strip("-")[:90]
+        ticket = await guild.create_text_channel(slug or "тикет", category=channel.category, overwrites=ow,
+                                                 reason=f"не играл {day}: {info['nick']}")
+        info["ticket"] = ticket.id
+        store.save()
         staff = f"<@&{STAFF_ROLE_ID}> " if STAFF_ROLE_ID else ""
         who = member.mention if member is not None else f"**{info['nick']}**"
-        await thread.send(f"{who} {staff}\nПочему {day} не играл?",
+        await ticket.send(f"{who} {staff}\nПочему {day} не играл?",
                           allowed_mentions=discord.AllowedMentions(users=True, roles=True))
         if member is None:
-            await thread.send("⚠️ Игрока нет на сервере, добавьте его в ветку вручную.")
+            await ticket.send("⚠️ Игрока нет на сервере, добавьте его в канал вручную.")
     except Exception as e:
         print(f"Не удалось открыть тикет: {short_error(e)}", flush=True)
-        await channel.send("⚠️ Не смог открыть тикет: нужны права «Создавать приватные ветки», «Управлять ветками» "
-                           "и «Отправлять сообщения в ветках».")
+        await channel.send("⚠️ Не смог открыть тикет: дай боту права «Управлять каналами» и «Управлять ролями».")
 
 
 async def apply_check_reaction(bot, payload, added: bool):
