@@ -1172,13 +1172,6 @@ class AdminView(discord.ui.View):
         if await self._guard(interaction):
             await send_status_list(interaction, "инактив")
 
-    @discord.ui.button(label="Кто зарегистрирован", style=discord.ButtonStyle.secondary, custom_id="admin:reg")
-    async def reg(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self._guard(interaction):
-            await interaction.response.defer()
-            for chunk in chunk_lines(await registration_report()):
-                await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
-
     @discord.ui.button(label="Сводка сейчас", style=discord.ButtonStyle.danger, custom_id="admin:report")
     async def report_now(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await self._guard(interaction):
