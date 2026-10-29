@@ -867,19 +867,24 @@ class InactiveModal(discord.ui.Modal, title="Инактив"):
 
 class AfkModal(discord.ui.Modal, title="АФК"):
     reason = discord.ui.TextInput(label="Причина", placeholder="Например: отошёл поесть", max_length=200)
-    minutes = discord.ui.TextInput(label="На сколько минут", placeholder="5", max_length=3, default="5")
+    hours = discord.ui.TextInput(label="Часы", placeholder="0", max_length=2, default="0", required=False)
+    minutes = discord.ui.TextInput(label="Минуты", placeholder="5", max_length=3, default="5", required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            mins = int(self.minutes.value.strip())
-            assert 1 <= mins <= 720
+            h = int(self.hours.value.strip() or 0)
+            m = int(self.minutes.value.strip() or 0)
+            assert h >= 0 and m >= 0 and 1 <= h * 60 + m <= 24 * 60
         except (ValueError, AssertionError):
-            await interaction.response.send_message("Минуты напиши числом от 1 до 720.", ephemeral=True)
+            await interaction.response.send_message(
+                "Часы и минуты напиши числами, всего от 1 минуты до 24 часов.", ephemeral=True)
             return
-        until = time.time() + mins * 60
+        total = h * 60 + m
+        until = time.time() + total * 60
         await set_status(interaction, "афк", self.reason.value.strip(), until)
+        span = " ".join(x for x in (f"{h} ч" if h else "", f"{m} мин" if m else "") if x)
         await interaction.response.send_message(
-            f"⏳ АФК на {mins} мин (до {dt.datetime.fromtimestamp(until, TZ):%H:%M}). "
+            f"⏳ АФК на {span} (до {dt.datetime.fromtimestamp(until, TZ):%H:%M}). "
             "Раньше можно вернуться кнопкой «Я вернулся».", ephemeral=True)
 
 
