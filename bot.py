@@ -15,25 +15,43 @@ from discord.ext import tasks
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 BM_TOKEN = os.environ.get("BM_TOKEN", "").strip()          # необязательно: без токена API работает с меньшим лимитом
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])                  # канал для ежедневной сводки
-MIN_HOURS = float(os.environ.get("MIN_HOURS", "8"))         # норма часов (и в гс, и в Rust)
-WINDOW_HOURS = float(os.environ.get("WINDOW_HOURS", "24"))  # за какой период считать (24 = сутки, 168 = неделя)
-REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколько слать сводку, UTC (09:00 UTC = 12:00 МСК)
 SCRIPT_URL = os.environ["SCRIPT_URL"]                       # адрес веб-приложения Google Apps Script из таблицы
 SCRIPT_SECRET = os.environ["SCRIPT_SECRET"]                 # секрет, такой же как в скрипте таблицы
+MIN_HOURS = float(os.environ.get("MIN_HOURS", "8"))         # норма часов (и в гс, и в Rust)
+WINDOW_HOURS = float(os.environ.get("WINDOW_HOURS", "24"))  # период ежедневной проверки (24 = сутки)
+REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколько слать сводку, UTC (09:00 UTC = 12:00 МСК)
 SERVER_IDS = {s.strip() for s in os.environ.get("SERVER_IDS", "").split(",") if s.strip()}  # пусто = все сервера
+TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "3"))  # часовой пояс для дат вайпа (3 = МСК)
+WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # сколько минут после старта вайпа ещё не опоздание
 # ================================
 
 API = "https://api.battlemetrics.com"
 BM_HEADERS = {"Authorization": f"Bearer {BM_TOKEN}"} if BM_TOKEN else {}
 BASE = Path(__file__).parent
 DATA_FILE = BASE / "data.json"
-KEEP_DAYS = 14
+KEEP_DAYS = 45
+TZ = dt.timezone(dt.timedelta(hours=TZ_OFFSET_HOURS))
+NO_PINGS = discord.AllowedMentions.none()
 
 _h, _m = (int(x) for x in REPORT_TIME_UTC.split(":"))
 REPORT_TIME = dt.time(hour=_h, minute=_m, tzinfo=dt.timezone.utc)
 
 
-# ---------- проверка карты ----------
+# ---------- даты ----------
+def parse_dt(s: str) -> float:
+    s = s.strip().replace("/", ".")
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M", "%d.%m.%Y %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt).replace(tzinfo=TZ).timestamp()
+        except ValueError:
+            pass
+    raise ValueError(s)
+
+
+def fmt_dt(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
+
+
 def luhn_ok(num: str) -> bool:
     total = 0
     for i, ch in enumerate(reversed(num)):
@@ -46,10 +64,81 @@ def luhn_ok(num: str) -> bool:
     return total % 10 == 0
 
 
-# ---------- таблица (профили) через Google Apps Script ----------
+# ---------- локальное хранилище: учёт гс и вайпы ----------
+class Store:
+    """voice: [[discord_id, start, end]]; open_voice: кто сейчас в гс; wipes: имя -> состояние вайпа."""
+
+    def __init__(self):
+        self.voice: list[list] = []
+        self.open_voice: dict[str, float] = {}
+        self.heartbeat: float = time.time()
+        self.wipes: dict[str, dict] = {}
+        if DATA_FILE.exists():
+            d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            self.voice = d.get("voice", [])
+            self.open_voice = d.get("open_voice", {})
+            self.heartbeat = d.get("heartbeat", time.time())
+            self.wipes = d.get("wipes", {})
+
+    def save(self):
+        self.heartbeat = time.time()
+        cutoff = time.time() - KEEP_DAYS * 86400
+        self.voice = [v for v in self.voice if v[2] >= cutoff]
+        tmp = DATA_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
+                                   "heartbeat": self.heartbeat, "wipes": self.wipes}), encoding="utf-8")
+        tmp.replace(DATA_FILE)
+
+    def reconcile(self, in_voice_now: set[str]):
+        """После перезапуска: кто остался в гс — продолжаем сессию, кто ушёл — закрываем по последнему heartbeat."""
+        for uid, start in list(self.open_voice.items()):
+            if uid not in in_voice_now:
+                self.voice.append([uid, start, max(start, self.heartbeat)])
+                del self.open_voice[uid]
+        for uid in in_voice_now:
+            self.open_voice.setdefault(uid, time.time())
+        self.save()
+
+    def voice_start(self, uid: str):
+        self.open_voice.setdefault(uid, time.time())
+        self.save()
+
+    def voice_stop(self, uid: str):
+        start = self.open_voice.pop(uid, None)
+        if start is not None:
+            self.voice.append([uid, start, time.time()])
+        self.save()
+
+    def spans(self, uid: str, now: float) -> list[tuple[float, float]]:
+        out = [(s, e) for u, s, e in self.voice if u == uid]
+        if uid in self.open_voice:
+            out.append((self.open_voice[uid], now))
+        return out
+
+    def voice_hours(self, uid: str, since: float, until: float) -> float:
+        total = 0.0
+        for s, e in self.spans(uid, until):
+            overlap = min(e, until) - max(s, since)
+            if overlap > 0:
+                total += overlap
+        return total / 3600
+
+    def arrival(self, uid: str, start: float, end: float, now: float) -> float | None:
+        """Когда игрок пришёл в гс на вайп: start, если уже сидел в гс на старте; иначе первый вход после старта."""
+        spans = self.spans(uid, now)
+        if any(s <= start < e for s, e in spans):
+            return start
+        later = [s for s, e in spans if start < s < end]
+        return min(later) if later else None
+
+
+store = Store()
+
+
+# ---------- таблица через Google Apps Script ----------
 async def sheet_call(payload: dict) -> dict:
     payload = {**payload, "secret": SCRIPT_SECRET}
-    timeout = aiohttp.ClientTimeout(total=40)
+    timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(SCRIPT_URL, json=payload) as r:  # Google отвечает редиректом, aiohttp идёт за ним
             r.raise_for_status()
@@ -59,61 +148,24 @@ async def sheet_call(payload: dict) -> dict:
     return data
 
 
-async def sheet_upsert(uid: str, name: str, steam: str, bm_id: int, region: str, card: str):
-    row = [uid, name, steam, f"https://www.battlemetrics.com/players/{bm_id}", region, card,
-           dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")]
-    await sheet_call({"action": "upsert", "row": row})
-
-
-async def sheet_profiles() -> dict[str, dict]:
+async def sheet_players() -> dict[str, dict]:
+    """Игроки с привязанным Discord ID (колонка F листа «общее»)."""
     out = {}
-    for r in (await sheet_call({"action": "list"}))["rows"]:
-        r = list(r) + [""] * (7 - len(r))
-        m = re.search(r"players/(\d+)", r[3])
-        if r[0] and m:
-            out[r[0]] = {"name": r[1], "steam": r[2], "bm": int(m.group(1)), "region": r[4], "card": r[5]}
+    for r in (await sheet_call({"action": "players_list"}))["rows"]:
+        r = list(r) + [""] * (8 - len(r))
+        if not re.fullmatch(r"\d{15,25}", r[5].strip()):
+            continue
+        m = re.search(r"players/(\d+)", r[4])
+        out[r[5].strip()] = {"nick": r[0].strip(), "role": r[1].strip(), "steam": r[6].strip(),
+                             "bm": int(m.group(1)) if m else None, "region": r[7].strip()}
     return out
 
 
-# ---------- учёт времени в гс (локально) ----------
-class Store:
-    """voice: список [discord_id, start_ts, end_ts]."""
-
-    def __init__(self):
-        self.voice: list[list] = []
-        self.open_voice: dict[str, float] = {}  # кто сейчас в гс -> время входа
-        if DATA_FILE.exists():
-            self.voice = json.loads(DATA_FILE.read_text(encoding="utf-8")).get("voice", [])
-
-    def save(self):
-        cutoff = time.time() - KEEP_DAYS * 86400
-        self.voice = [v for v in self.voice if v[2] >= cutoff]
-        tmp = DATA_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"voice": self.voice}), encoding="utf-8")
-        tmp.replace(DATA_FILE)
-
-    def voice_start(self, uid: str):
-        self.open_voice.setdefault(uid, time.time())
-
-    def voice_stop(self, uid: str):
-        start = self.open_voice.pop(uid, None)
-        if start is not None:
-            self.voice.append([uid, start, time.time()])
-            self.save()
-
-    def voice_hours(self, uid: str, since: float, now: float) -> float:
-        total = 0.0
-        spans = [(s, e) for u, s, e in self.voice if u == uid]
-        if uid in self.open_voice:
-            spans.append((self.open_voice[uid], now))
-        for s, e in spans:
-            overlap = min(e, now) - max(s, since)
-            if overlap > 0:
-                total += overlap
-        return total / 3600
-
-
-store = Store()
+async def sheet_wipe_status(w: dict, status: str):
+    w["status"] = status
+    store.save()
+    await sheet_call({"action": "wipe_upsert",
+                      "row": [w["name"], fmt_dt(w["start"]), fmt_dt(w["end"]), status]})
 
 
 # ---------- BattleMetrics ----------
@@ -169,11 +221,23 @@ async def bm_player_name(session, bm_id: int) -> str | None:
         return None
 
 
-# ---------- сводка ----------
+def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+# ---------- ежедневная сводка ----------
 async def build_report() -> list[str]:
-    profiles = await sheet_profiles()
+    profiles = await sheet_players()
     if not profiles:
-        return ["В таблице нет заполненных профилей. Админ может выложить кнопку командой `/panel`."]
+        return ["В таблице нет игроков с привязанным Discord. Админ может выложить кнопку командой `/panel`."]
 
     now_dt = dt.datetime.now(dt.timezone.utc)
     since_dt = now_dt - dt.timedelta(hours=WINDOW_HOURS)
@@ -188,10 +252,13 @@ async def build_report() -> list[str]:
                 ok += 1
                 continue
             # шаг 2: в гс мало — смотрим Rust в BattleMetrics
+            if p["bm"] is None:
+                failed.append(uid)
+                continue
             try:
                 rust = await rust_hours(session, p["bm"], since_dt, now_dt)
             except Exception as e:
-                print(f"BM ошибка для {uid}/{p.get('bm')}: {e}")
+                print(f"BM ошибка для {uid}/{p['bm']}: {e}")
                 failed.append(uid)
                 continue
             if rust >= MIN_HOURS:
@@ -205,37 +272,135 @@ async def build_report() -> list[str]:
         lazy.sort(key=lambda x: (x[3], x[2]))
         lines.append(f"⚠️ Не набрали {MIN_HOURS:g} ч ни в гс, ни в Rust за последние {period}:")
         for uid, p, voice, rust in lazy:
-            extra = []
-            if p.get("region"):
+            extra = [p["role"]] if p["role"] else []
+            if p["region"]:
                 extra.append(p["region"])
-            if p.get("steam"):
-                extra.append(f"[Steam](<{p['steam']}>)")
             extra.append(f"[BM](<https://www.battlemetrics.com/players/{p['bm']}>)")
-            lines.append(f"• <@{uid}> — гс {voice:.1f} ч, Rust {rust:.1f} ч · " + " · ".join(extra))
+            lines.append(f"• <@{uid}> ({p['nick']}) — гс {voice:.1f} ч, Rust {rust:.1f} ч · " + " · ".join(extra))
     else:
         lines.append(f"✅ За последние {period} все проверенные выполнили норму ({MIN_HOURS:g} ч).")
     if ok:
         lines.append(f"Выполнили норму: {ok}")
     if failed:
-        lines.append("Не удалось проверить BattleMetrics: " + ", ".join(f"<@{u}>" for u in failed))
-
-    chunks, cur = [], ""
-    for line in lines:  # режем под лимит Discord (2000 символов)
-        if len(cur) + len(line) + 1 > 1900:
-            chunks.append(cur)
-            cur = ""
-        cur += line + "\n"
-    chunks.append(cur)
-    return chunks
+        lines.append("Не удалось проверить (нет ссылки BM или BattleMetrics не ответил): "
+                     + ", ".join(f"<@{u}>" for u in failed))
+    return chunk_lines(lines)
 
 
-# ---------- профиль ----------
+# ---------- вайп ----------
+def attendance_label(arrival: float | None, start: float, final: bool) -> tuple[str, int | str]:
+    """-> (явка, опоздание в минутах)."""
+    if arrival is None:
+        return ("не явился" if final else "нет в гс (пока)"), ""
+    late = max(0, round((arrival - start) / 60))
+    return ("вовремя" if late <= WIPE_GRACE_MIN else "опоздал"), late
+
+
+async def attendance_rows(w: dict, profiles: dict, final: bool, now: float, with_rust=None) -> list[list]:
+    rows = []
+    for uid, p in profiles.items():
+        arr = store.arrival(uid, w["start"], w["end"], now)
+        label, late = attendance_label(arr, w["start"], final)
+        voice = round(store.voice_hours(uid, w["start"], min(now, w["end"])), 1)
+        rust = with_rust.get(uid, "") if with_rust is not None else ""
+        rows.append([w["name"], p["nick"], uid, label, late, voice, rust])
+    return rows
+
+
+async def start_wipe(bot, w: dict):
+    profiles = await sheet_players()
+    now = time.time()
+    await sheet_wipe_status(w, "идёт")
+    rows = await attendance_rows(w, profiles, final=False, now=now)
+    await sheet_call({"action": "results_write", "wipe": w["name"], "rows": rows})
+    present = [r for r in rows if r[3] == "вовремя"]
+    absent = [r for r in rows if r[3] != "вовремя"]
+    lines = [f"🟢 **{w['name']}** начался ({fmt_dt(w['start'])}). В гс: {len(present)} из {len(rows)}."]
+    if absent:
+        lines.append("Нет в гс: " + ", ".join(f"<@{r[2]}>" for r in absent))
+        lines.append(f"Кто зайдёт позже, будет отмечен как опоздавший (допуск {WIPE_GRACE_MIN:g} мин).")
+    channel = bot.get_channel(w["channel"]) or await bot.fetch_channel(w["channel"])
+    for chunk in chunk_lines(lines):
+        await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+
+async def finish_wipe(bot, w: dict):
+    w["status"] = "подсчёт"  # чтобы тик не запустил подсчёт повторно
+    store.save()
+    channel = bot.get_channel(w["channel"]) or await bot.fetch_channel(w["channel"])
+    try:
+        await _finish_wipe(channel, w)
+    except Exception as e:
+        print(f"Ошибка подсчёта итогов «{w['name']}»: {e}")
+        w["status"] = "ошибка итогов"
+        store.save()
+        await channel.send(f"Не удалось посчитать итоги **{w['name']}**: {e}. Смотри логи бота.")
+
+
+async def _finish_wipe(channel, w: dict):
+    await channel.send(f"🔴 **{w['name']}** завершён. Считаю итоги, это займёт несколько минут...")
+    profiles = await sheet_players()
+    now = time.time()
+    since_dt = dt.datetime.fromtimestamp(w["start"], dt.timezone.utc)
+    end_dt = dt.datetime.fromtimestamp(w["end"], dt.timezone.utc)
+
+    rust: dict[str, float | str] = {}
+    async with aiohttp.ClientSession() as session:
+        for uid, p in profiles.items():
+            if p["bm"] is None:
+                rust[uid] = ""
+                continue
+            try:
+                rust[uid] = round(await rust_hours(session, p["bm"], since_dt, end_dt), 1)
+            except Exception as e:
+                print(f"BM ошибка для {uid}/{p['bm']}: {e}")
+                rust[uid] = ""
+
+    rows = await attendance_rows(w, profiles, final=True, now=now, with_rust=rust)
+    rows.sort(key=lambda r: (r[6] if isinstance(r[6], (int, float)) else -1), reverse=True)
+    await sheet_call({"action": "results_write", "wipe": w["name"], "rows": rows})
+    await sheet_wipe_status(w, "завершён")
+
+    lines = [f"📊 **Итоги {w['name']}** ({fmt_dt(w['start'])} — {fmt_dt(w['end'])})"]
+    for _, nick, uid, label, late, voice, r in rows:
+        rust_txt = f"{r:.1f} ч" if isinstance(r, (int, float)) else "нет данных"
+        late_txt = f" {late} мин" if label == "опоздал" else ""
+        lines.append(f"• <@{uid}> ({nick}) — Rust {rust_txt}, гс {voice:.1f} ч, {label}{late_txt}")
+    late_n = sum(1 for r in rows if r[3] == "опоздал")
+    miss_n = sum(1 for r in rows if r[3] == "не явился")
+    lines.append(f"Опоздали: {late_n}, не явились: {miss_n}, всего игроков: {len(rows)}.")
+    for chunk in chunk_lines(lines):
+        await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+
+async def import_wipes_from_sheet():
+    """Если data.json потерян: подхватить из листа «вайп» ожидающие и идущие вайпы."""
+    for r in (await sheet_call({"action": "wipes_list"}))["rows"]:
+        r = list(r) + [""] * (4 - len(r))
+        name, status = r[0].strip(), r[3].strip()
+        if not name or name in store.wipes or status not in ("ожидает", "идёт"):
+            continue
+        try:
+            store.wipes[name] = {"name": name, "start": parse_dt(r[1]), "end": parse_dt(r[2]),
+                                 "status": status, "channel": CHANNEL_ID}
+        except ValueError:
+            print(f"вайп «{name}»: не разобрал даты {r[1]!r}, {r[2]!r}")
+    store.save()
+
+
+# ---------- кнопки и формы ----------
+def is_admin(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.manage_guild)
+
+
 class ProfileModal(discord.ui.Modal, title="Мой профиль"):
+    nick = discord.ui.TextInput(label="Ник в игре", placeholder="Как записан в таблице клана", max_length=60)
     steam = discord.ui.TextInput(
         label="Ваш Steam ID", placeholder="76561198000000000 или ссылка на профиль Steam", max_length=200)
     bm = discord.ui.TextInput(
         label="Ваш BattleMetrics", placeholder="https://www.battlemetrics.com/players/123456789", max_length=200)
-    region = discord.ui.TextInput(label="Регион", placeholder="Например: Москва", max_length=60)
+    region = discord.ui.TextInput(label="Регион", placeholder="Например: UA, EU, Москва", max_length=60)
     card = discord.ui.TextInput(
         label="Карта для выплат (только номер)", placeholder="Без срока и CVV", max_length=30)
 
@@ -277,15 +442,65 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
 
         try:
-            await sheet_upsert(str(interaction.user.id), str(interaction.user),
-                               steam, bm_id, self.region.value.strip(), card)
+            res = await sheet_call({"action": "player_upsert", "p": {
+                "discord": str(interaction.user.id), "nick": self.nick.value.strip(), "steam": steam,
+                "bm_id": bm_id, "bm_url": f"https://www.battlemetrics.com/players/{bm_id}",
+                "region": self.region.value.strip(), "card": card}})
         except Exception as e:
             print(f"Ошибка записи в таблицу: {e}")
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
             return
+        how = {"discord": "обновил твою строку", "bm": "нашёл твою строку по ссылке BattleMetrics",
+               "nick": "нашёл твою строку по нику", "new": "добавил новую строку"}.get(res.get("how"), "записал")
         await interaction.followup.send(
-            f"Записал в таблицу. Ник в Rust: **{name}**, регион: {self.region.value.strip()}, карта •••• {digits[-4:]}.",
+            f"Готово, {how}. Ник в Rust: **{name}**, регион: {self.region.value.strip()}, карта •••• {digits[-4:]}.",
             ephemeral=True)
+
+
+class WipeModal(discord.ui.Modal, title="Новый вайп"):
+    def __init__(self):
+        super().__init__()
+        n = len(store.wipes) + 1
+        now = dt.datetime.now(TZ)
+        self.name = discord.ui.TextInput(label="Название", default=f"Вайп {n}", max_length=40)
+        self.start = discord.ui.TextInput(
+            label=f"Начало (ДД.ММ.ГГГГ ЧЧ:ММ, пояс UTC{TZ_OFFSET_HOURS:+g})",
+            default=now.strftime("%d.%m.%Y %H:%M"), max_length=20)
+        self.end = discord.ui.TextInput(
+            label="Конец (ДД.ММ.ГГГГ ЧЧ:ММ)",
+            default=(now + dt.timedelta(days=14)).strftime("%d.%m.%Y %H:%M"), max_length=20)
+        for item in (self.name, self.start, self.end):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name.value.strip()
+        try:
+            start, end = parse_dt(self.start.value), parse_dt(self.end.value)
+        except ValueError:
+            await interaction.response.send_message(
+                "Не разобрал дату. Формат: 29.10.2026 20:00", ephemeral=True)
+            return
+        if end <= start or end <= time.time():
+            await interaction.response.send_message("Конец должен быть позже начала и в будущем.", ephemeral=True)
+            return
+        if name in store.wipes:
+            await interaction.response.send_message(f"Вайп с названием «{name}» уже есть.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        w = {"name": name, "start": start, "end": end, "status": "ожидает", "channel": interaction.channel_id}
+        store.wipes[name] = w
+        try:
+            await sheet_wipe_status(w, "ожидает")
+        except Exception as e:
+            del store.wipes[name]
+            store.save()
+            print(f"Ошибка записи вайпа в таблицу: {e}")
+            await interaction.followup.send("Не удалось записать вайп в таблицу, скажи админу.", ephemeral=True)
+            return
+        await interaction.followup.send("Вайп создан.", ephemeral=True)
+        await interaction.channel.send(
+            f"📅 **{name}** запланирован: {fmt_dt(start)} — {fmt_dt(end)}. "
+            f"В момент старта бот отметит, кто в голосовом канале.")
 
 
 class PanelView(discord.ui.View):
@@ -297,6 +512,18 @@ class PanelView(discord.ui.View):
         await interaction.response.send_modal(ProfileModal())
 
 
+class WipeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Вайп", style=discord.ButtonStyle.danger, custom_id="panel:wipe")
+    async def wipe(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Создавать вайп могут только админы.", ephemeral=True)
+            return
+        await interaction.response.send_modal(WipeModal())
+
+
 # ---------- бот ----------
 class Bot(discord.Client):
     def __init__(self):
@@ -306,15 +533,18 @@ class Bot(discord.Client):
 
     async def setup_hook(self):
         self.add_view(PanelView())
+        self.add_view(WipeView())
         await self.tree.sync()
         self.daily_report.start()
+        self.wipe_tick.start()
 
     async def on_ready(self):
-        for guild in self.guilds:  # подхватить тех, кто уже сидит в гс на момент запуска
-            for vc in guild.voice_channels:
-                for m in vc.members:
-                    if not m.bot:
-                        store.voice_start(str(m.id))
+        in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
+        store.reconcile(in_voice)
+        try:
+            await import_wipes_from_sheet()
+        except Exception as e:
+            print(f"Не удалось прочитать вайпы из таблицы: {e}")
         print(f"Бот запущен как {self.user}")
 
     async def on_voice_state_update(self, member, before, after):
@@ -330,40 +560,94 @@ class Bot(discord.Client):
     async def daily_report(self):
         channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
         for chunk in await build_report():
-            await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+            await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+    @tasks.loop(seconds=20)
+    async def wipe_tick(self):
+        store.save()  # heartbeat: отметка «бот жив», нужна для учёта гс при перезапуске
+        now = time.time()
+        for w in list(store.wipes.values()):
+            try:
+                if w["status"] == "ожидает" and now >= w["start"]:
+                    await start_wipe(self, w)
+                if w["status"] == "идёт" and now >= w["end"]:
+                    await finish_wipe(self, w)
+            except Exception as e:
+                print(f"Ошибка вайпа «{w['name']}»: {e}")
+
+    @wipe_tick.before_loop
+    async def _wait(self):
+        await self.wait_until_ready()
 
 
 bot = Bot()
 
 
-def is_admin(interaction: discord.Interaction) -> bool:
-    perms = getattr(interaction.user, "guild_permissions", None)
-    return bool(perms and perms.manage_guild)
-
-
-@bot.tree.command(name="panel", description="Выложить сообщение с кнопкой профиля (для админов)")
-@app_commands.default_permissions(manage_guild=True)
-async def panel(interaction: discord.Interaction):
+async def admin_only(interaction: discord.Interaction) -> bool:
     if not is_admin(interaction):
         await interaction.response.send_message("Только для админов.", ephemeral=True)
+        return False
+    return True
+
+
+@bot.tree.command(name="panel", description="Выложить кнопку «Мой профиль» (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def panel(interaction: discord.Interaction):
+    if not await admin_only(interaction):
         return
     await interaction.channel.send(
-        "**Клановая панель**\nНажми «Мой профиль» и заполни: Steam ID, ссылку на BattleMetrics, регион и карту для выплат. "
-        "Без этого бот не видит твой онлайн. Данные попадают в клановую таблицу.",
+        "**Клановая панель**\nНажми «Мой профиль» и заполни: ник, Steam ID, ссылку на BattleMetrics, регион и карту "
+        "для выплат. Данные попадают в клановую таблицу.",
         view=PanelView(),
     )
     await interaction.response.send_message("Панель выложена.", ephemeral=True)
 
 
-@bot.tree.command(name="report", description="Запустить проверку прямо сейчас (для админов)")
+@bot.tree.command(name="wipe_panel", description="Выложить кнопку «Вайп» (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def wipe_panel(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.channel.send(
+        "**Вайп**\nАдмин нажимает «Вайп» и указывает название, дату и время начала и конца. "
+        "В момент старта бот отметит, кто пришёл в голосовой канал и кто опоздал, "
+        "а по окончании выложит статистику: кто сколько наиграл.",
+        view=WipeView(),
+    )
+    await interaction.response.send_message("Кнопка выложена.", ephemeral=True)
+
+
+@bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def wipe_status(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not store.wipes:
+        await interaction.followup.send("Вайпов пока нет.")
+        return
+    profiles = await sheet_players()
+    now = time.time()
+    lines = []
+    for w in store.wipes.values():
+        lines.append(f"**{w['name']}**: {w['status']}, {fmt_dt(w['start'])} — {fmt_dt(w['end'])}")
+        if w["status"] == "идёт":
+            rows = await attendance_rows(w, profiles, final=False, now=now)
+            for _, nick, uid, label, late, voice, _r in rows:
+                late_txt = f" {late} мин" if label == "опоздал" else ""
+                lines.append(f"• {nick} — {label}{late_txt}, гс {voice:.1f} ч")
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="report", description="Запустить проверку нормы прямо сейчас (для админов)")
 @app_commands.default_permissions(manage_guild=True)
 async def report(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
+    if not await admin_only(interaction):
         return
     await interaction.response.defer(ephemeral=True)
     for chunk in await build_report():
-        await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
 
 
 bot.run(DISCORD_TOKEN)
