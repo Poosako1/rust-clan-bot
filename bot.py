@@ -828,8 +828,8 @@ async def start_wipe(bot, w: dict):
         lines.append("Нет в гс: " + ", ".join(f"<@{r[2]}>" for r in absent))
         lines.append(f"Кто зайдёт позже, будет отмечен как опоздавший (допуск {WIPE_GRACE_MIN:g} мин).")
     channel = bot.get_channel(w["channel"]) or await bot.fetch_channel(w["channel"])
-    for chunk in chunk_lines(lines):
-        await channel.send(chunk, allowed_mentions=NO_PINGS)
+    for chunk in chunk_lines(lines):  # без разрешения на упоминания Discord показывает «Неизвестный пользователь»
+        await channel.send(chunk, allowed_mentions=discord.AllowedMentions(users=True))
 
 
 async def finish_wipe(bot, w: dict):
@@ -1559,7 +1559,7 @@ async def registered(interaction: discord.Interaction, channel: discord.TextChan
         await interaction.followup.send(head + "\nВсе заполнили.")
         return
     lines = [head, f"**Не заполнили: {len(missing)}**"]
-    lines += [f"• {m.mention}" for m in missing]
+    lines += [f"• {m.mention}" if notify else f"• {m.display_name} ({m.name})" for m in missing]
     if notify:
         lines.append("Нажмите «Мой профиль» в канале анкеты и заполните форму.")
     allowed = discord.AllowedMentions(users=True) if notify else NO_PINGS
