@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import difflib
+import traceback
 import datetime as dt
 from pathlib import Path
 
@@ -233,6 +234,20 @@ async def sheet_players() -> dict[str, dict]:
         out[r[5].strip()] = {"nick": r[0].strip(), "role": r[1].strip(), "steam": r[6].strip(),
                              "bm": int(m.group(1)) if m else None, "region": r[7].strip()}
     return out
+
+
+async def registration_report() -> list[str]:
+    """Кто заполнил анкету (в таблице есть Discord ID), а кого ещё нет."""
+    done, todo = [], []
+    for r in (await sheet_get(SHEET_PLAYERS))[1:]:
+        r = padded(r, PLAYER_COLS)
+        if not r[0].strip():
+            continue
+        (done if re.fullmatch(r"\d{15,25}", r[5].strip()) else todo).append(r[0].strip())
+    lines = [f"**Заполнили анкету: {len(done)} из {len(done) + len(todo)}**"]
+    if todo:
+        lines += [f"**Не заполнили: {len(todo)}**"] + [f"• {n}" for n in todo]
+    return lines
 
 
 async def upsert_player(p: dict) -> dict:
@@ -892,7 +907,23 @@ def profile_payload(uid: str, discord_name: str, bm_id: int, bm_name: str,
             "if_empty": {"1": bm_name}}
 
 
-class ProfileModal(discord.ui.Modal, title="Мой профиль"):
+class SafeModal(discord.ui.Modal):
+    """Любая ошибка в форме пишется в лог (с текстом ошибки) и игрок получает понятный ответ."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        print(f"Ошибка в форме «{self.title}» у {interaction.user} ({interaction.user.id}):", flush=True)
+        traceback.print_exception(type(error), error, error.__traceback__)
+        msg = "Не получилось записать. Нажми кнопку и заполни форму ещё раз, если снова не выйдет, напиши админу."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
+
+class ProfileModal(SafeModal, title="Мой профиль"):
     steam = discord.ui.TextInput(
         label="Ваш Steam ID", placeholder="76561198000000000 или ссылка на профиль Steam", max_length=200)
     bm = discord.ui.TextInput(
@@ -956,6 +987,7 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             print(f"Ошибка записи в таблицу: {e}", flush=True)
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
             return
+        print(f"Анкета: {interaction.user} ({interaction.user.id}) -> {res.get('how')}", flush=True)
         how = {"discord": "обновил твою строку", "bm": "нашёл твою строку по ссылке BattleMetrics",
                "nick": "нашёл твою строку по нику", "new": "добавил новую строку"}.get(res.get("how"), "записал")
         await interaction.followup.send(
@@ -963,7 +995,7 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             f"выплаты: ••••{digits[-4:]}.", ephemeral=True)
 
 
-class WipeModal(discord.ui.Modal, title="Новый вайп"):
+class WipeModal(SafeModal, title="Новый вайп"):
     def __init__(self):
         super().__init__()
         n = len(store.wipes) + 1
@@ -1030,7 +1062,7 @@ async def set_status(interaction: discord.Interaction, kind: str, reason: str, u
     await sheet_status_log(nick, uid, kind, reason, until)
 
 
-class InactiveModal(discord.ui.Modal, title="Инактив"):
+class InactiveModal(SafeModal, title="Инактив"):
     reason = discord.ui.TextInput(label="Причина", placeholder="Например: уехал в школу",
                                   style=discord.TextStyle.paragraph, max_length=200)
     until = discord.ui.TextInput(label="До какой даты (ДД.ММ.ГГГГ)", placeholder="05.11.2026", max_length=10)
@@ -1051,7 +1083,7 @@ class InactiveModal(discord.ui.Modal, title="Инактив"):
             "Вернуться раньше можно кнопкой «Я вернулся».", ephemeral=True)
 
 
-class AfkModal(discord.ui.Modal, title="АФК"):
+class AfkModal(SafeModal, title="АФК"):
     reason = discord.ui.TextInput(label="Причина", placeholder="Например: отошёл поесть", max_length=200)
     hours = discord.ui.TextInput(label="Часы", placeholder="0", max_length=2, default="0", required=False)
     minutes = discord.ui.TextInput(label="Минуты", placeholder="5", max_length=3, default="5", required=False)
@@ -1139,6 +1171,13 @@ class AdminView(discord.ui.View):
     async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await self._guard(interaction):
             await send_status_list(interaction, "инактив")
+
+    @discord.ui.button(label="Кто зарегистрирован", style=discord.ButtonStyle.secondary, custom_id="admin:reg")
+    async def reg(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await interaction.response.defer()
+            for chunk in chunk_lines(await registration_report()):
+                await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
 
     @discord.ui.button(label="Сводка сейчас", style=discord.ButtonStyle.danger, custom_id="admin:report")
     async def report_now(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1391,8 +1430,8 @@ async def setup_channels(guild) -> list[str]:
                 async for m in ch.history(limit=30):
                     if m.author.id == guild.me.id:
                         if m.content != panel[0]:
-                            await m.edit(content=panel[0], view=panel[1]())
                             notes.append(f"обновлён текст панели в #{name}")
+                        await m.edit(content=panel[0], view=panel[1]())
                         break
             except Exception as e:
                 print(f"Не удалось обновить панель в #{name}: {short_error(e)}", flush=True)
@@ -1467,6 +1506,16 @@ async def setup_channels_cmd(interaction: discord.Interaction):
     lines.append(f"Выдай игрокам роль «{CLAN_ROLE_NAME}», лидерам роль «{STAFF_ROLE_NAME}». "
                  "Сводка теперь выкладывается в #сводка.")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="registered", description="Кто заполнил анкету, а кто нет (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def registered(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    for chunk in chunk_lines(await registration_report()):
+        await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
 
 
 @bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
