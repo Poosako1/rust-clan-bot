@@ -1039,8 +1039,7 @@ async def status_panel(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await interaction.channel.send(
-        "**Статус**\nНе можешь играть? Нажми «Инактив» (на несколько дней) или «АФК» (отошёл на время) "
-        "и напиши причину. Вернулся раньше, жми «Я вернулся». Кнопка «Кто играет» для лидера.",
+        "**Статус**\nНе можешь играть? Нажми инактив. Отошёл на время - нажми афк",
         view=StatusView(),
     )
     await interaction.response.send_message("Кнопки выложены.", ephemeral=True)
