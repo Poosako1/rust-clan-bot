@@ -1,3 +1,3 @@
 discord.py>=2.4
 aiohttp>=3.9
-cryptography>=42
+gspread>=6.1,<7

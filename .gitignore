@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 data.json
 data.tmp
-secret.key
+google.json

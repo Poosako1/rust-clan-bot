@@ -8,7 +8,7 @@ from pathlib import Path
 
 import aiohttp
 import discord
-from cryptography.fernet import Fernet
+import gspread
 from discord import app_commands
 from discord.ext import tasks
 
@@ -19,6 +19,9 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])                  # канал для 
 MIN_HOURS = float(os.environ.get("MIN_HOURS", "8"))         # норма часов (и в гс, и в Rust)
 WINDOW_HOURS = float(os.environ.get("WINDOW_HOURS", "24"))  # за какой период считать (24 = сутки, 168 = неделя)
 REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколько слать сводку, UTC (09:00 UTC = 12:00 МСК)
+SHEET_ID = os.environ["SHEET_ID"]                           # ID Google-таблицы (из ссылки между /d/ и /edit)
+SHEET_TAB = os.environ.get("SHEET_TAB", "Профили")          # вкладка, создастся сама
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "google.json")  # json сервисного аккаунта
 SERVER_IDS = {s.strip() for s in os.environ.get("SERVER_IDS", "").split(",") if s.strip()}  # пусто = все сервера
 # ================================
 
@@ -26,24 +29,13 @@ API = "https://api.battlemetrics.com"
 BM_HEADERS = {"Authorization": f"Bearer {BM_TOKEN}"} if BM_TOKEN else {}
 BASE = Path(__file__).parent
 DATA_FILE = BASE / "data.json"
-KEY_FILE = BASE / "secret.key"
 KEEP_DAYS = 14
 
 _h, _m = (int(x) for x in REPORT_TIME_UTC.split(":"))
 REPORT_TIME = dt.time(hour=_h, minute=_m, tzinfo=dt.timezone.utc)
 
 
-# ---------- шифрование карт ----------
-def load_fernet() -> Fernet:
-    if not KEY_FILE.exists():
-        KEY_FILE.write_bytes(Fernet.generate_key())
-        os.chmod(KEY_FILE, 0o600)
-    return Fernet(KEY_FILE.read_bytes())
-
-
-fernet = load_fernet()
-
-
+# ---------- проверка карты ----------
 def luhn_ok(num: str) -> bool:
     total = 0
     for i, ch in enumerate(reversed(num)):
@@ -56,28 +48,64 @@ def luhn_ok(num: str) -> bool:
     return total % 10 == 0
 
 
-# ---------- хранилище ----------
-class Store:
-    """profiles: discord_id -> {steam, bm, region, card_enc}; voice: список [discord_id, start_ts, end_ts]."""
+# ---------- таблица (профили) ----------
+HEADERS = ["Discord ID", "Discord", "Steam", "BattleMetrics", "Регион", "Карта", "Обновлено"]
+
+
+class Sheet:
+    """Профили лежат в Google-таблице: одна строка на игрока, ключ — Discord ID (колонка A)."""
 
     def __init__(self):
-        self.profiles: dict[str, dict] = {}
+        cred = Path(GOOGLE_CREDENTIALS)
+        if not cred.is_absolute():
+            cred = BASE / cred
+        gc = gspread.service_account(filename=str(cred))
+        sh = gc.open_by_key(SHEET_ID)
+        try:
+            self.ws = sh.worksheet(SHEET_TAB)
+        except gspread.WorksheetNotFound:
+            self.ws = sh.add_worksheet(SHEET_TAB, rows=500, cols=len(HEADERS))
+        if self.ws.row_values(1)[:len(HEADERS)] != HEADERS:
+            self.ws.update(values=[HEADERS], range_name="A1")
+
+    def upsert(self, uid: str, name: str, steam: str, bm_id: int, region: str, card: str):
+        row = [uid, name, steam, f"https://www.battlemetrics.com/players/{bm_id}", region, card,
+               dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")]
+        ids = self.ws.col_values(1)
+        if uid in ids:
+            n = ids.index(uid) + 1
+            self.ws.update(values=[row], range_name=f"A{n}:G{n}")
+        else:
+            self.ws.append_row(row)
+
+    def all_profiles(self) -> dict[str, dict]:
+        out = {}
+        for r in self.ws.get_all_values()[1:]:
+            r = r + [""] * (len(HEADERS) - len(r))
+            m = re.search(r"players/(\d+)", r[3])
+            if r[0] and m:
+                out[r[0]] = {"name": r[1], "steam": r[2], "bm": int(m.group(1)), "region": r[4], "card": r[5]}
+        return out
+
+
+sheet = Sheet()
+
+
+# ---------- учёт времени в гс (локально) ----------
+class Store:
+    """voice: список [discord_id, start_ts, end_ts]."""
+
+    def __init__(self):
         self.voice: list[list] = []
         self.open_voice: dict[str, float] = {}  # кто сейчас в гс -> время входа
         if DATA_FILE.exists():
-            d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            self.profiles = d.get("profiles", {})
-            self.voice = d.get("voice", [])
-            for uid, bm_id in d.get("links", {}).items():  # данные прошлой версии
-                self.profiles.setdefault(uid, {"steam": "", "bm": bm_id, "region": "", "card_enc": ""})
+            self.voice = json.loads(DATA_FILE.read_text(encoding="utf-8")).get("voice", [])
 
     def save(self):
         cutoff = time.time() - KEEP_DAYS * 86400
         self.voice = [v for v in self.voice if v[2] >= cutoff]
         tmp = DATA_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"profiles": self.profiles, "voice": self.voice}, ensure_ascii=False),
-                       encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        tmp.write_text(json.dumps({"voice": self.voice}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def voice_start(self, uid: str):
@@ -159,8 +187,9 @@ async def bm_player_name(session, bm_id: int) -> str | None:
 
 # ---------- сводка ----------
 async def build_report() -> list[str]:
-    if not store.profiles:
-        return ["Нет заполненных профилей. Админ может выложить кнопку командой `/panel`."]
+    profiles = await asyncio.to_thread(sheet.all_profiles)
+    if not profiles:
+        return ["В таблице нет заполненных профилей. Админ может выложить кнопку командой `/panel`."]
 
     now_dt = dt.datetime.now(dt.timezone.utc)
     since_dt = now_dt - dt.timedelta(hours=WINDOW_HOURS)
@@ -168,7 +197,7 @@ async def build_report() -> list[str]:
 
     lazy, ok, failed = [], 0, []
     async with aiohttp.ClientSession() as session:
-        for uid, p in store.profiles.items():
+        for uid, p in profiles.items():
             # шаг 1: гс. Набрал норму — BattleMetrics не трогаем
             voice = store.voice_hours(uid, since, now)
             if voice >= MIN_HOURS:
@@ -218,27 +247,15 @@ async def build_report() -> list[str]:
 
 # ---------- профиль ----------
 class ProfileModal(discord.ui.Modal, title="Мой профиль"):
-    def __init__(self, existing: dict | None = None):
-        super().__init__()
-        e = existing or {}
-        self.steam = discord.ui.TextInput(
-            label="Ваш Steam ID", placeholder="76561198000000000 или ссылка на профиль Steam",
-            default=e.get("steam") or None, max_length=200)
-        self.bm = discord.ui.TextInput(
-            label="Ваш BattleMetrics", placeholder="https://www.battlemetrics.com/players/123456789",
-            default=f"https://www.battlemetrics.com/players/{e['bm']}" if e.get("bm") else None, max_length=200)
-        self.region = discord.ui.TextInput(
-            label="Регион", placeholder="Например: Москва", default=e.get("region") or None, max_length=60)
-        self.card = discord.ui.TextInput(
-            label="Карта для выплат (только номер)", placeholder="Без срока и CVV. Пусто = оставить прежнюю",
-            required=False, max_length=30)
-        for item in (self.steam, self.bm, self.region, self.card):
-            self.add_item(item)
+    steam = discord.ui.TextInput(
+        label="Ваш Steam ID", placeholder="76561198000000000 или ссылка на профиль Steam", max_length=200)
+    bm = discord.ui.TextInput(
+        label="Ваш BattleMetrics", placeholder="https://www.battlemetrics.com/players/123456789", max_length=200)
+    region = discord.ui.TextInput(label="Регион", placeholder="Например: Москва", max_length=60)
+    card = discord.ui.TextInput(
+        label="Карта для выплат (только номер)", placeholder="Без срока и CVV", max_length=30)
 
     async def on_submit(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        old = store.profiles.get(uid, {})
-
         raw_steam = self.steam.value.strip()
         m = re.search(r"7656119\d{10}", raw_steam)
         if m:
@@ -259,16 +276,12 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
         bm_id = int(m.group(1))
 
-        card_digits = re.sub(r"\D", "", self.card.value)
-        if self.card.value.strip():
-            if not (13 <= len(card_digits) <= 19) or not luhn_ok(card_digits):
-                await interaction.response.send_message(
-                    "Номер карты не прошёл проверку. Введи только номер (13-19 цифр), без срока и CVV.",
-                    ephemeral=True)
-                return
-            card_enc = fernet.encrypt(card_digits.encode()).decode()
-        else:
-            card_enc = old.get("card_enc", "")
+        digits = re.sub(r"\D", "", self.card.value)
+        if not (13 <= len(digits) <= 19) or not luhn_ok(digits):
+            await interaction.response.send_message(
+                "Номер карты не прошёл проверку. Введи только номер (13-19 цифр), без срока и CVV.", ephemeral=True)
+            return
+        card = " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
 
         await interaction.response.defer(ephemeral=True)
         async with aiohttp.ClientSession() as session:
@@ -279,12 +292,15 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
                 ephemeral=True)
             return
 
-        store.profiles[uid] = {"steam": steam, "bm": bm_id, "region": self.region.value.strip(), "card_enc": card_enc}
-        store.save()
-        card_note = f"карта •••• {card_digits[-4:]}" if self.card.value.strip() else (
-            "карта сохранена ранее" if card_enc else "карта не указана")
+        try:
+            await asyncio.to_thread(sheet.upsert, str(interaction.user.id), str(interaction.user),
+                                    steam, bm_id, self.region.value.strip(), card)
+        except Exception as e:
+            print(f"Ошибка записи в таблицу: {e}")
+            await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
+            return
         await interaction.followup.send(
-            f"Профиль сохранён. Ник в Rust: **{name}**, регион: {self.region.value.strip()}, {card_note}.",
+            f"Записал в таблицу. Ник в Rust: **{name}**, регион: {self.region.value.strip()}, карта •••• {digits[-4:]}.",
             ephemeral=True)
 
 
@@ -294,7 +310,7 @@ class PanelView(discord.ui.View):
 
     @discord.ui.button(label="Мой профиль", style=discord.ButtonStyle.primary, custom_id="panel:profile")
     async def profile(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ProfileModal(store.profiles.get(str(interaction.user.id))))
+        await interaction.response.send_modal(ProfileModal())
 
 
 # ---------- бот ----------
@@ -349,7 +365,7 @@ async def panel(interaction: discord.Interaction):
         return
     await interaction.channel.send(
         "**Клановая панель**\nНажми «Мой профиль» и заполни: Steam ID, ссылку на BattleMetrics, регион и карту для выплат. "
-        "Без этого бот не видит твой онлайн. Карта хранится в зашифрованном виде, видна только админам.",
+        "Без этого бот не видит твой онлайн. Данные попадают в клановую таблицу.",
         view=PanelView(),
     )
     await interaction.response.send_message("Панель выложена.", ephemeral=True)
@@ -364,24 +380,6 @@ async def report(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     for chunk in await build_report():
         await interaction.followup.send(chunk, allowed_mentions=discord.AllowedMentions.none())
-
-
-@bot.tree.command(name="card", description="Показать карту игрока для выплаты (для админов)")
-@app_commands.describe(member="Чью карту показать")
-@app_commands.default_permissions(manage_guild=True)
-async def card(interaction: discord.Interaction, member: discord.Member):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Только для админов.", ephemeral=True)
-        return
-    p = store.profiles.get(str(member.id))
-    if not p or not p.get("card_enc"):
-        await interaction.response.send_message("У этого игрока карта не указана.", ephemeral=True)
-        return
-    num = fernet.decrypt(p["card_enc"].encode()).decode()
-    grouped = " ".join(num[i:i + 4] for i in range(0, len(num), 4))
-    await interaction.response.send_message(
-        f"{member.mention}: `{grouped}`\nРегион: {p.get('region') or '—'}. Видно только тебе.",
-        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 bot.run(DISCORD_TOKEN)
