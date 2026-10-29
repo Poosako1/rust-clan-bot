@@ -24,8 +24,6 @@ REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколь�
 SERVER_IDS = {s.strip() for s in os.environ.get("SERVER_IDS", "").split(",") if s.strip()}  # пусто = все сервера
 TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "3"))  # часовой пояс для дат вайпа (3 = МСК)
 WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # сколько минут после старта вайпа ещё не опоздание
-RUST_SERVER = os.environ.get("RUST_SERVER", "").strip()     # connect-адрес Rust-сервера IP:порт (необязательно)
-GAME_POLL_SEC = 60                                            # как часто опрашивать сервер, кто онлайн
 # ================================
 
 API = "https://api.battlemetrics.com"
@@ -78,10 +76,6 @@ class Store:
         self.open_voice: dict[str, float] = {}
         self.heartbeat: float = time.time()
         self.wipes: dict[str, dict] = {}
-        self.game: list[list] = []          # [[discord_id, start, end]] время в Rust (по опросу сервера)
-        self.open_game: dict[str, list] = {}  # кто сейчас на сервере: [начало, последний раз виден]
-        self.game_started: float = 0          # когда начался учёт игры
-        self.server: str = ""                 # адрес сервера текущего вайпа
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         if DATA_FILE.exists():
@@ -92,10 +86,6 @@ class Store:
             self.wipes = d.get("wipes", {})
             self.checks = d.get("checks", {})
             self.statuses = d.get("statuses", {})
-            self.game = d.get("game", [])
-            self.open_game = d.get("open_game", {})
-            self.game_started = d.get("game_started", 0)
-            self.server = d.get("server", "")
 
     def save(self):
         self.heartbeat = time.time()
@@ -103,13 +93,10 @@ class Store:
         self.voice = [v for v in self.voice if v[2] >= cutoff]
         self.checks = {k: v for k, v in self.checks.items() if v["rid"] >= cutoff}
         self.statuses = {k: v for k, v in self.statuses.items() if v["until"] >= time.time() - 86400}
-        self.game = [g for g in self.game if g[2] >= cutoff]
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
-                                   "checks": self.checks, "statuses": self.statuses, "game": self.game,
-                                   "open_game": self.open_game, "game_started": self.game_started,
-                                   "server": self.server}), encoding="utf-8")
+                                   "checks": self.checks, "statuses": self.statuses}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -146,33 +133,6 @@ class Store:
                 total += overlap
         return total / 3600
 
-    def game_update(self, present: set[str], now: float):
-        """Результат опроса сервера: кто онлайн в Rust прямо сейчас."""
-        half = GAME_POLL_SEC / 2
-        if not self.game_started:
-            self.game_started = now
-        for uid in present:
-            cur = self.open_game.get(uid)
-            if cur is not None and now - cur[1] > GAME_POLL_SEC * 3:  # долго не видели: старую сессию закрываем
-                self.game.append([uid, cur[0], cur[1] + half])
-                cur = None
-            if cur is None:
-                self.open_game[uid] = [now - half, now]
-            else:
-                cur[1] = now
-        for uid in [u for u in self.open_game if u not in present]:
-            start, last = self.open_game.pop(uid)
-            self.game.append([uid, start, last + half])
-        self.save()
-
-    def game_hours(self, uid: str, since: float, until: float) -> float:
-        spans = [(s, e) for u, s, e in self.game if u == uid]
-        if uid in self.open_game:
-            s, last = self.open_game[uid]
-            spans.append((s, last + GAME_POLL_SEC / 2))
-        total = sum(max(0.0, min(e, until) - max(s, since)) for s, e in spans)
-        return total / 3600
-
     def arrival(self, uid: str, start: float, end: float, now: float) -> float | None:
         """Когда игрок пришёл в гс на вайп: start, если уже сидел в гс на старте; иначе первый вход после старта."""
         spans = self.spans(uid, now)
@@ -188,104 +148,6 @@ store = Store()
 def active_status(uid: str, now: float | None = None) -> dict | None:
     st = store.statuses.get(uid)
     return st if st and st["until"] > (now or time.time()) else None
-
-
-# ---------- Rust-сервер: кто онлайн (запрос A2S по UDP) ----------
-def parse_server(text: str) -> tuple[str, int] | None:
-    m = re.search(r"([\w.\-]+):(\d{2,5})\s*$", (text or "").strip())
-    return (m.group(1), int(m.group(2))) if m else None
-
-
-def current_server() -> tuple[str, int] | None:
-    return parse_server(store.server) or parse_server(RUST_SERVER)
-
-
-class _UDP(asyncio.DatagramProtocol):
-    def __init__(self):
-        self.q: asyncio.Queue = asyncio.Queue()
-
-    def datagram_received(self, data, addr):
-        self.q.put_nowait(data)
-
-
-async def a2s_players(host: str, port: int, timeout: float = 3.0) -> list[str]:
-    loop = asyncio.get_running_loop()
-    tr, pr = await loop.create_datagram_endpoint(_UDP, remote_addr=(host, port))
-
-    async def recv() -> bytes:
-        d = await asyncio.wait_for(pr.q.get(), timeout)
-        if d[:4] != b"\xfe\xff\xff\xff":
-            return d
-        parts = {}  # ответ разбит на пакеты
-        while True:
-            parts[d[9]] = d[12:]
-            if len(parts) >= d[8]:
-                return b"".join(parts[i] for i in sorted(parts))
-            d = await asyncio.wait_for(pr.q.get(), timeout)
-
-    try:
-        tr.sendto(b"\xff\xff\xff\xffU\xff\xff\xff\xff")
-        d = await recv()
-        if d[4] == 0x41:  # сервер просит подтвердить запрос
-            tr.sendto(b"\xff\xff\xff\xffU" + d[5:9])
-            d = await recv()
-        if d[4] != 0x44:
-            raise ValueError("неожиданный ответ сервера")
-        names, pos = [], 6
-        for _ in range(d[5]):
-            end = d.index(b"\x00", pos + 1)
-            names.append(d[pos + 1:end].decode("utf-8", "replace"))
-            pos = end + 1 + 8  # счёт и время
-        return names
-    finally:
-        tr.close()
-
-
-_query_port: dict[tuple, int] = {}
-
-
-async def query_players(host: str, port: int) -> list[str]:
-    """Порт запросов у Rust обычно на 1 больше порта игры; запоминаем тот, который ответил."""
-    tried = [_query_port[(host, port)]] if (host, port) in _query_port else []
-    tried += [p for p in (port + 1, port, port + 2, port - 1) if p not in tried]
-    last = None
-    for p in tried:
-        try:
-            names = await a2s_players(host, p)
-            _query_port[(host, port)] = p
-            return names
-        except Exception as e:
-            last = e
-    raise last or RuntimeError("нет ответа")
-
-
-def norm_nick(s: str) -> str:
-    base = re.sub(r"\[[^\]]*\]|\([^)]*\)", "", s)
-    out = re.sub(r"[\W_]+", "", base.casefold())
-    return out or re.sub(r"[\W_]+", "", s.casefold())
-
-
-_nick_cache = {"at": 0.0, "map": {}}
-
-
-async def game_nick_map() -> dict[str, str]:
-    if time.time() - _nick_cache["at"] > 600:
-        profiles = await sheet_players()
-        _nick_cache["map"] = {norm_nick(p["nick"]): uid for uid, p in profiles.items() if norm_nick(p["nick"])}
-        _nick_cache["at"] = time.time()
-    return _nick_cache["map"]
-
-
-async def poll_game() -> bool:
-    """Один опрос сервера. True, если сервер ответил."""
-    server = current_server()
-    if not server:
-        return False
-    names = await query_players(*server)
-    nick_map = await game_nick_map()
-    present = {nick_map[n] for n in map(norm_nick, names) if n in nick_map}
-    store.game_update(present, time.time())
-    return True
 
 
 # ---------- таблица через Google Apps Script ----------
@@ -530,11 +392,6 @@ async def compute_report() -> dict:
                 ok += 1
                 continue
             rust = None
-            if not USE_BM and current_server():  # свой учёт Rust по опросу сервера
-                rust = store.game_hours(uid, since, now)
-                if rust >= MIN_HOURS:
-                    ok += 1
-                    continue
             if USE_BM:  # шаг 2 (только с токеном BattleMetrics): в гс мало, смотрим Rust
                 if p["bm"] is None:
                     failed.append((uid, p["nick"], "нет ссылки BattleMetrics в таблице"))
@@ -550,9 +407,7 @@ async def compute_report() -> dict:
                     continue
             lazy.append({"uid": uid, "nick": p["nick"], "bm": p["bm"], "voice": voice, "rust": rust})
     lazy.sort(key=lambda x: (x["rust"] if x["rust"] is not None else 0, x["voice"]))
-    return {"empty": None, "lazy": lazy, "ok": ok, "failed": failed, "inactive": inactive,
-            "game_hours": (now - store.game_started) / 3600 if (current_server() and not USE_BM) else None,
-            "period": f"{WINDOW_HOURS:g} ч"}
+    return {"empty": None, "lazy": lazy, "ok": ok, "failed": failed, "inactive": inactive, "period": f"{WINDOW_HOURS:g} ч"}
 
 
 def lazy_line(x: dict) -> str:
@@ -563,7 +418,7 @@ def lazy_line(x: dict) -> str:
 
 def report_header(data: dict) -> str:
     if data["lazy"]:
-        if USE_BM or current_server():
+        if USE_BM:
             return f"⚠️ Не набрали {MIN_HOURS:g} ч ни в гс, ни в Rust за последние {data['period']}:"
         return f"⚠️ Меньше {MIN_HOURS:g} ч в гс за последние {data['period']}:"
     if data["ok"]:
@@ -575,9 +430,6 @@ def report_tail(data: dict) -> list[str]:
     lines = []
     if data["ok"] and data["lazy"]:
         lines.append(f"Выполнили норму: {data['ok']}")
-    gh = data.get("game_hours")
-    if gh is not None and gh < WINDOW_HOURS:
-        lines.append(f"ℹ️ Учёт игры в Rust идёт только {gh:.1f} ч, часы в Rust пока могут быть неполными.")
     if data.get("inactive"):
         lines.append(f"В инактиве (не проверялись): {data['inactive']}")
     if data["failed"]:
@@ -746,9 +598,6 @@ async def attendance_rows(w: dict, profiles: dict, final: bool, now: float, with
 async def start_wipe(bot, w: dict):
     profiles = await sheet_players()
     now = time.time()
-    if w.get("server"):  # с этого вайпа опрашиваем его сервер
-        store.server = w["server"]
-        store.save()
     await sheet_wipe_status(w, "идёт")
     rows = await attendance_rows(w, profiles, final=False, now=now)
     await sheet_results_write(w["name"], rows)
@@ -795,10 +644,6 @@ async def _finish_wipe(channel, w: dict):
                 except Exception as e:
                     print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
                     rust[uid] = ""
-
-    elif current_server():  # свой учёт по опросу сервера
-        for uid in profiles:
-            rust[uid] = round(store.game_hours(uid, w["start"], w["end"]), 1)
 
     rows = await attendance_rows(w, profiles, final=True, now=now, with_rust=rust)
     rows.sort(key=lambda r: ((r[6] if isinstance(r[6], (int, float)) else -1), r[5]), reverse=True)
@@ -944,10 +789,7 @@ class WipeModal(discord.ui.Modal, title="Новый вайп"):
         self.end = discord.ui.TextInput(
             label="Конец (ДД.ММ.ГГГГ ЧЧ:ММ)",
             default=(now + dt.timedelta(days=14)).strftime("%d.%m.%Y %H:%M"), max_length=20)
-        self.server = discord.ui.TextInput(
-            label="Сервер (connect IP:порт, можно пусто)", placeholder="185.207.214.98:35010",
-            default=store.server or RUST_SERVER, required=False, max_length=60)
-        for item in (self.name, self.start, self.end, self.server):
+        for item in (self.name, self.start, self.end):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -964,15 +806,8 @@ class WipeModal(discord.ui.Modal, title="Новый вайп"):
         if name in store.wipes:
             await interaction.response.send_message(f"Вайп с названием «{name}» уже есть.", ephemeral=True)
             return
-        server_raw = self.server.value.strip()
-        if server_raw and not parse_server(server_raw):
-            await interaction.response.send_message("Адрес сервера не разобрал. Пример: 185.207.214.98:35010",
-                                                    ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True)
         w = {"name": name, "start": start, "end": end, "status": "ожидает", "channel": interaction.channel_id}
-        if server_raw:
-            w["server"] = "%s:%d" % parse_server(server_raw)
         store.wipes[name] = w
         try:
             await sheet_wipe_status(w, "ожидает")
@@ -1119,7 +954,6 @@ class Bot(discord.Client):
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
-        self.game_tick.start()
 
     async def on_ready(self):
         in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
@@ -1162,20 +996,6 @@ class Bot(discord.Client):
                     await finish_wipe(self, w)
             except Exception as e:
                 print(f"Ошибка вайпа «{w['name']}»: {e}", flush=True)
-
-    @tasks.loop(seconds=GAME_POLL_SEC)
-    async def game_tick(self):
-        try:
-            await poll_game()
-            self._game_err = 0
-        except Exception as e:
-            self._game_err = getattr(self, "_game_err", 0) + 1
-            if self._game_err in (1, 30):  # не засорять лог
-                print(f"Сервер Rust не ответил: {short_error(e)}", flush=True)
-
-    @game_tick.before_loop
-    async def _wait_game(self):
-        await self.wait_until_ready()
 
     @wipe_tick.before_loop
     async def _wait(self):
