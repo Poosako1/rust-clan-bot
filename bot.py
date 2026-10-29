@@ -26,6 +26,7 @@ TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "3"))  # часово�
 WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # сколько минут после старта вайпа ещё не опоздание
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "").strip()          # ключ OpenRouter (редактор текста, необязательно)
 EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # канал-редактор
+EDITOR_ENABLED = os.environ.get("EDITOR_ENABLED", "0") == "1"   # редактор текста выключен, пока не включён явно
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 # ================================
@@ -172,7 +173,7 @@ def staff_role_id() -> int:
 
 
 def use_editor() -> bool:
-    return bool(OPENROUTER_KEY and editor_channel_id())
+    return bool(EDITOR_ENABLED and OPENROUTER_KEY and editor_channel_id())
 
 
 def is_staff_member(member) -> bool:
@@ -1173,7 +1174,7 @@ class WipeView(discord.ui.View):
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()  # voice_states входит в default
-        if OPENROUTER_KEY:
+        if EDITOR_ENABLED and OPENROUTER_KEY:
             intents.message_content = True  # нужно включить «Message Content Intent» в портале разработчика
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
@@ -1341,7 +1342,7 @@ CHANNEL_PLAN = [
     ("report", "сводка", "staff", False, None),
     ("wipe", "вайп", "clan", False, (TEXT_WIPE, WipeView)),
     ("status", "статус", "clan", False, (TEXT_STATUS, StatusView)),
-    ("editor", "редактор", "staff", True, None),
+    *([("editor", "редактор", "staff", True, None)] if EDITOR_ENABLED else []),
     ("admin", "админ-панель", "staff", False, (TEXT_ADMIN, AdminView)),
 ]
 
