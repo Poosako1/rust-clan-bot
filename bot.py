@@ -895,6 +895,13 @@ class StatusView(discord.ui.View):
     async def afk(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AfkModal())
 
+    @discord.ui.button(label="Кто играет", style=discord.ButtonStyle.primary, custom_id="status:who", row=1)
+    async def who(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Список видят только админы.", ephemeral=True)
+            return
+        await send_who_plays(interaction)
+
     @discord.ui.button(label="Я вернулся", style=discord.ButtonStyle.success, custom_id="status:back")
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = str(interaction.user.id)
@@ -1033,17 +1040,14 @@ async def status_panel(interaction: discord.Interaction):
         return
     await interaction.channel.send(
         "**Статус**\nНе можешь играть? Нажми «Инактив» (на несколько дней) или «АФК» (отошёл на время) "
-        "и напиши причину. Вернулся раньше, жми «Я вернулся».",
+        "и напиши причину. Вернулся раньше, жми «Я вернулся». Кнопка «Кто играет» для лидера.",
         view=StatusView(),
     )
     await interaction.response.send_message("Кнопки выложены.", ephemeral=True)
 
 
-@bot.tree.command(name="кто_играет", description="Кто сейчас должен играть (для админов)")
-@app_commands.default_permissions(manage_guild=True)
-async def who_plays(interaction: discord.Interaction):
-    if not await admin_only(interaction):
-        return
+async def send_who_plays(interaction: discord.Interaction):
+    """Список: кто сейчас должен играть (ответ в канал)."""
     await interaction.response.defer()
     profiles = await sheet_players()
     if not profiles:
@@ -1066,6 +1070,14 @@ async def who_plays(interaction: discord.Interaction):
         lines += [f"**В инактиве: {len(away)}**"] + away
     for chunk in chunk_lines(lines):
         await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="кто_играет", description="Кто сейчас должен играть (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def who_plays(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await send_who_plays(interaction)
 
 
 @bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
