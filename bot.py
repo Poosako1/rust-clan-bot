@@ -1365,11 +1365,11 @@ def channel_overwrites(guild, vis: str, staff_write: bool, staff, clan) -> dict:
 async def setup_channels(guild) -> list[str]:
     """Создать роли, закрытые каналы и панели. Ничего не дублирует при повторном запуске."""
     notes = []
-    staff = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    staff = guild.get_role(cfg_id("staff")) or discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
     if staff is None:
         staff = await guild.create_role(name=STAFF_ROLE_NAME, reason="rust-clan-bot")
         notes.append(f"создана роль «{STAFF_ROLE_NAME}»")
-    clan = discord.utils.get(guild.roles, name=CLAN_ROLE_NAME)
+    clan = guild.get_role(cfg_id("member")) or discord.utils.get(guild.roles, name=CLAN_ROLE_NAME)
     if clan is None:
         clan = await guild.create_role(name=CLAN_ROLE_NAME, reason="rust-clan-bot")
         notes.append(f"создана роль «{CLAN_ROLE_NAME}»")
@@ -1398,6 +1398,55 @@ async def setup_channels(guild) -> list[str]:
         store.cfg[key] = ch.id
     store.save()
     return notes
+
+
+async def apply_roles(guild, staff=None, clan=None) -> list[str]:
+    """Сменить роли стаффа и клана и перенастроить доступ в уже созданных каналах."""
+    old_staff, old_clan = guild.get_role(cfg_id("staff")), guild.get_role(cfg_id("member"))
+    if staff is not None:
+        store.cfg["staff"] = staff.id
+    if clan is not None:
+        store.cfg["member"] = clan.id
+    new_staff, new_clan = guild.get_role(cfg_id("staff")), guild.get_role(cfg_id("member"))
+    store.save()
+    notes = []
+    if new_staff is None or new_clan is None:
+        return ["каналы пока не созданы или роли не заданы, доступ настроится при /setup_channels"]
+    for key, name, vis, staff_write, panel in CHANNEL_PLAN:
+        ch = guild.get_channel(cfg_id(key))
+        if ch is None:
+            continue
+        for old, new in ((old_staff, new_staff), (old_clan, new_clan)):
+            if old is not None and old.id != new.id and old.id not in (new_staff.id, new_clan.id):
+                await ch.set_permissions(old, overwrite=None)
+        for target, ow in channel_overwrites(guild, vis, staff_write, new_staff, new_clan).items():
+            await ch.set_permissions(target, overwrite=ow)
+        notes.append(f"#{ch.name}")
+    return notes
+
+
+@bot.tree.command(name="roles", description="Роли стаффа и клана (для админов)")
+@app_commands.describe(staff="Роль лидеров и стаффа", clan="Роль участников клана")
+@app_commands.default_permissions(manage_guild=True)
+async def roles_cmd(interaction: discord.Interaction, staff: discord.Role | None = None,
+                    clan: discord.Role | None = None):
+    if not await admin_only(interaction):
+        return
+    if staff is None and clan is None:
+        st, cl = interaction.guild.get_role(cfg_id("staff")), interaction.guild.get_role(cfg_id("member"))
+        await interaction.response.send_message(
+            f"Стафф: {st.mention if st else 'не задана'}\nКлан: {cl.mention if cl else 'не задана'}",
+            ephemeral=True, allowed_mentions=NO_PINGS)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        notes = await apply_roles(interaction.guild, staff, clan)
+    except Exception as e:
+        await interaction.followup.send(f"Не получилось: {short_error(e)}. Нужны права «Управлять каналами» "
+                                        "и «Управлять ролями».", ephemeral=True)
+        return
+    await interaction.followup.send("Роли сохранены. Доступ обновлён: " + (", ".join(notes) or "каналов пока нет") + ".",
+                                    ephemeral=True)
 
 
 @bot.tree.command(name="setup_channels", description="Создать закрытые каналы, роли и панели (для админов)")
