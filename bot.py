@@ -1259,7 +1259,7 @@ TEXT_WIPE = ("**Вайп**\nАдмин нажимает «Вайп» и указ
              "В момент старта бот отметит, кто пришёл в голосовой канал и кто опоздал, "
              "а по окончании выложит статистику: кто сколько наиграл.")
 TEXT_STATUS = "**Статус**\nНе можешь играть? Нажми инактив. Отошёл на время - нажми афк"
-TEXT_ADMIN = "**Админ-панель**\nКто сейчас должен играть, кто в АФК и кто в инактиве. Видно только лидерам."
+TEXT_ADMIN = "**Админ-панель**\nКто сейчас должен играть, кто в АФК и кто в инактиве."
 
 
 @bot.tree.command(name="panel", description="Выложить кнопку «Мой профиль» (для админов)")
@@ -1385,6 +1385,16 @@ async def setup_channels(guild) -> list[str]:
             notes.append(f"создан канал #{name} ({'видят все, писать нельзя' if vis == 'all' else 'приватный'})")
             if panel:
                 await ch.send(panel[0], view=panel[1]())
+        elif panel:  # канал уже есть: обновить текст и кнопки существующей панели
+            try:
+                async for m in ch.history(limit=30):
+                    if m.author.id == guild.me.id:
+                        if m.content != panel[0]:
+                            await m.edit(content=panel[0], view=panel[1]())
+                            notes.append(f"обновлён текст панели в #{name}")
+                        break
+            except Exception as e:
+                print(f"Не удалось обновить панель в #{name}: {short_error(e)}", flush=True)
         store.cfg[key] = ch.id
     store.save()
     return notes
