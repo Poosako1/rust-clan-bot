@@ -149,11 +149,29 @@ async def sheet_call(payload: dict) -> dict:
     return data
 
 
+SHEET_PLAYERS, SHEET_WIPES, SHEET_RESULTS = "общее", "вайп", "итоги вайпа"
+PLAYER_COLS = 9  # Никнейм | роль | зарплата | банк | батлметрикс | Discord ID | Steam | Регион | Discord
+
+
+async def sheet_get(name: str) -> list[list[str]]:
+    """Весь лист вместе с заголовком."""
+    return (await sheet_call({"ops": [{"op": "get", "sheet": name}]}))["results"][0]
+
+
+def padded(row: list, n: int) -> list:
+    return list(row) + [""] * (n - len(row))
+
+
+def role_rank(role: str) -> int:
+    r = role.strip().lower()
+    return ROLES.index(r) if r in ROLES else 99
+
+
 async def sheet_players() -> dict[str, dict]:
-    """Игроки с привязанным Discord ID (колонка F листа «общее»)."""
+    """Игроки с привязанным Discord ID (столбец F листа «общее»)."""
     out = {}
-    for r in (await sheet_call({"action": "players_list"}))["rows"]:
-        r = list(r) + [""] * (8 - len(r))
+    for r in (await sheet_get(SHEET_PLAYERS))[1:]:
+        r = padded(r, PLAYER_COLS)
         if not re.fullmatch(r"\d{15,25}", r[5].strip()):
             continue
         m = re.search(r"players/(\d+)", r[4])
@@ -162,11 +180,70 @@ async def sheet_players() -> dict[str, dict]:
     return out
 
 
+async def upsert_player(p: dict) -> dict:
+    """Найти строку игрока (Discord ID, потом ссылка BM, потом ник) или вставить новую в блок его роли."""
+    rows = await sheet_get(SHEET_PLAYERS)
+    body = [padded(r, PLAYER_COLS) for r in rows[1:]]
+    idx, how = None, "new"
+    for i, r in enumerate(body):
+        if r[5].strip() == p["discord"]:
+            idx, how = i, "discord"
+            break
+    if idx is None:
+        for i, r in enumerate(body):
+            m = re.search(r"players/(\d+)", r[4])
+            if m and int(m.group(1)) == p["bm_id"]:
+                idx, how = i, "bm"
+                break
+    if idx is None and p.get("nick"):
+        for i, r in enumerate(body):
+            if r[0].strip().lower() == p["nick"].strip().lower():
+                idx, how = i, "nick"
+                break
+
+    ops = []
+    if idx is not None:
+        row_no, existing = idx + 2, body[idx]
+    else:
+        mine = role_rank(p.get("role", ""))
+        pos = next((i for i, r in enumerate(body) if role_rank(r[1]) > mine), len(body))
+        row_no, existing = pos + 2, [""] * PLAYER_COLS
+        if pos < len(body):
+            ops.append({"op": "insert_before", "sheet": SHEET_PLAYERS, "row": row_no})
+    cells = dict(p.get("cells", {}))
+    for col, value in p.get("if_empty", {}).items():
+        if not existing[int(col) - 1].strip():
+            cells[col] = value
+    for col, value in cells.items():
+        ops.append({"op": "set", "sheet": SHEET_PLAYERS, "row": row_no, "col": int(col),
+                    "values": [[str(value)]], "text": True})
+    await sheet_call({"ops": ops})
+    return {"how": how, "row": row_no}
+
+
 async def sheet_wipe_status(w: dict, status: str):
     w["status"] = status
     store.save()
-    await sheet_call({"action": "wipe_upsert",
-                      "row": [w["name"], fmt_dt(w["start"]), fmt_dt(w["end"]), status]})
+    rows = await sheet_get(SHEET_WIPES)
+    row_no = next((i + 1 for i, r in enumerate(rows) if i > 0 and r and r[0] == w["name"]), max(len(rows), 1) + 1)
+    await sheet_call({"ops": [{"op": "set", "sheet": SHEET_WIPES, "row": row_no, "col": 1, "text": True,
+                               "values": [[w["name"], fmt_dt(w["start"]), fmt_dt(w["end"]), status]]}]})
+
+
+async def sheet_results_write(wipe: str, results: list[list]):
+    """Заменить строки этого вайпа на листе «итоги вайпа»."""
+    rows = await sheet_get(SHEET_RESULTS)
+    drop = [i + 1 for i, r in enumerate(rows) if i > 0 and r and r[0] == wipe]
+    start = max(len(rows) - len(drop), 1) + 1
+    ops = []
+    if drop:
+        ops.append({"op": "delete_rows", "sheet": SHEET_RESULTS, "rows": drop})
+    if results:
+        ops.append({"op": "set", "sheet": SHEET_RESULTS, "row": start, "col": 1, "text": True,
+                    "values": [r[:4] for r in results]})
+        ops.append({"op": "set", "sheet": SHEET_RESULTS, "row": start, "col": 5, "values": [r[4:7] for r in results]})
+    if ops:
+        await sheet_call({"ops": ops})
 
 
 # ---------- BattleMetrics ----------
@@ -313,7 +390,7 @@ async def start_wipe(bot, w: dict):
     now = time.time()
     await sheet_wipe_status(w, "идёт")
     rows = await attendance_rows(w, profiles, final=False, now=now)
-    await sheet_call({"action": "results_write", "wipe": w["name"], "rows": rows})
+    await sheet_results_write(w["name"], rows)
     present = [r for r in rows if r[3] == "вовремя"]
     absent = [r for r in rows if r[3] != "вовремя"]
     lines = [f"🟢 **{w['name']}** начался ({fmt_dt(w['start'])}). В гс: {len(present)} из {len(rows)}."]
@@ -359,7 +436,7 @@ async def _finish_wipe(channel, w: dict):
 
     rows = await attendance_rows(w, profiles, final=True, now=now, with_rust=rust)
     rows.sort(key=lambda r: (r[6] if isinstance(r[6], (int, float)) else -1), reverse=True)
-    await sheet_call({"action": "results_write", "wipe": w["name"], "rows": rows})
+    await sheet_results_write(w["name"], rows)
     await sheet_wipe_status(w, "завершён")
 
     lines = [f"📊 **Итоги {w['name']}** ({fmt_dt(w['start'])} — {fmt_dt(w['end'])})"]
@@ -376,8 +453,8 @@ async def _finish_wipe(channel, w: dict):
 
 async def import_wipes_from_sheet():
     """Если data.json потерян: подхватить из листа «вайп» ожидающие и идущие вайпы."""
-    for r in (await sheet_call({"action": "wipes_list"}))["rows"]:
-        r = list(r) + [""] * (4 - len(r))
+    for r in (await sheet_get(SHEET_WIPES))[1:]:
+        r = padded(r, 4)
         name, status = r[0].strip(), r[3].strip()
         if not name or name in store.wipes or status not in ("ожидает", "идёт"):
             continue
@@ -478,9 +555,9 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
             return
 
         try:
-            res = await sheet_call({"action": "player_upsert", "p": profile_payload(
+            res = await upsert_player(profile_payload(
                 str(interaction.user.id), interaction.user.name, bm_id, name,
-                steam, self.region.value.strip(), role, payout)})
+                steam, self.region.value.strip(), role, payout))
         except Exception as e:
             print(f"Ошибка записи в таблицу: {e}")
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
