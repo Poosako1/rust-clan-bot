@@ -76,6 +76,7 @@ class Store:
         self.open_voice: dict[str, float] = {}
         self.heartbeat: float = time.time()
         self.wipes: dict[str, dict] = {}
+        self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -84,16 +85,18 @@ class Store:
             self.heartbeat = d.get("heartbeat", time.time())
             self.wipes = d.get("wipes", {})
             self.checks = d.get("checks", {})
+            self.statuses = d.get("statuses", {})
 
     def save(self):
         self.heartbeat = time.time()
         cutoff = time.time() - KEEP_DAYS * 86400
         self.voice = [v for v in self.voice if v[2] >= cutoff]
         self.checks = {k: v for k, v in self.checks.items() if v["rid"] >= cutoff}
+        self.statuses = {k: v for k, v in self.statuses.items() if v["until"] >= time.time() - 86400}
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
-                                   "checks": self.checks}), encoding="utf-8")
+                                   "checks": self.checks, "statuses": self.statuses}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -142,6 +145,11 @@ class Store:
 store = Store()
 
 
+def active_status(uid: str, now: float | None = None) -> dict | None:
+    st = store.statuses.get(uid)
+    return st if st and st["until"] > (now or time.time()) else None
+
+
 # ---------- таблица через Google Apps Script ----------
 async def sheet_call(payload: dict) -> dict:
     payload = {**payload, "secret": SCRIPT_SECRET}
@@ -156,6 +164,7 @@ async def sheet_call(payload: dict) -> dict:
 
 
 SHEET_PLAYERS, SHEET_WIPES, SHEET_RESULTS, SHEET_CHECKS = "общее", "вайп", "итоги вайпа", "проверки"
+SHEET_STATUS = "статусы"
 PLAYER_COLS = 9  # Никнейм | роль | зарплата | банк | батлметрикс | Discord ID | Steam | Регион | Discord
 
 
@@ -261,6 +270,17 @@ async def sheet_checks_add(label: str, entries: list[tuple[str, str, float]]):
                                "values": values}]})
 
 
+async def sheet_status_log(nick: str, uid: str, kind: str, reason: str, until: float):
+    """Дописать строку в лист «статусы» (журнал инактива и АФК). Ошибки не критичны."""
+    try:
+        rows = await sheet_get(SHEET_STATUS)
+        await sheet_call({"ops": [{"op": "set", "sheet": SHEET_STATUS, "row": max(len(rows), 1) + 1, "col": 1,
+                                   "text": True, "values": [[fmt_dt(time.time()), nick, uid, kind, reason,
+                                                             fmt_dt(until) if until else ""]]}]})
+    except Exception as e:
+        print(f"Не удалось записать статус в таблицу: {short_error(e)}", flush=True)
+
+
 async def sheet_check_set(label: str, uid: str, nick: str, decision: str, by: str):
     rows = await sheet_get(SHEET_CHECKS)
     row_no = next((i + 1 for i, r in enumerate(rows) if i > 0 and len(r) > 2 and r[0] == label and r[2] == uid), None)
@@ -359,9 +379,13 @@ async def compute_report() -> dict:
     since_dt = now_dt - dt.timedelta(hours=WINDOW_HOURS)
     now, since = now_dt.timestamp(), since_dt.timestamp()
 
-    lazy, ok, failed = [], 0, []
+    lazy, ok, failed, inactive = [], 0, [], 0
     async with aiohttp.ClientSession() as session:
         for uid, p in profiles.items():
+            st = active_status(uid, now)
+            if st and st["kind"] == "инактив":  # в инактиве: не проверяем
+                inactive += 1
+                continue
             # шаг 1: гс. Набрал норму, всё в порядке
             voice = store.voice_hours(uid, since, now)
             if voice >= MIN_HOURS:
@@ -383,7 +407,7 @@ async def compute_report() -> dict:
                     continue
             lazy.append({"uid": uid, "nick": p["nick"], "bm": p["bm"], "voice": voice, "rust": rust})
     lazy.sort(key=lambda x: (x["rust"] if x["rust"] is not None else 0, x["voice"]))
-    return {"empty": None, "lazy": lazy, "ok": ok, "failed": failed, "period": f"{WINDOW_HOURS:g} ч"}
+    return {"empty": None, "lazy": lazy, "ok": ok, "failed": failed, "inactive": inactive, "period": f"{WINDOW_HOURS:g} ч"}
 
 
 def lazy_line(x: dict) -> str:
@@ -406,6 +430,8 @@ def report_tail(data: dict) -> list[str]:
     lines = []
     if data["ok"] and data["lazy"]:
         lines.append(f"Выполнили норму: {data['ok']}")
+    if data.get("inactive"):
+        lines.append(f"В инактиве (не проверялись): {data['inactive']}")
     if data["failed"]:
         lines.append("Не удалось проверить:")
         lines += [f"• {nick}: {reason}" for _, nick, reason in data["failed"]]
@@ -797,6 +823,90 @@ class WipeModal(discord.ui.Modal, title="Новый вайп"):
             f"В момент старта бот отметит, кто в голосовом канале.")
 
 
+def parse_day_end(text: str) -> float:
+    """ДД.ММ.ГГГГ (или ДД.ММ.ГГ, ДД.ММ) -> конец этого дня по МСК."""
+    t = text.strip().replace("/", ".")
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d.%m"):
+        try:
+            d = dt.datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        if fmt == "%d.%m":
+            d = d.replace(year=dt.datetime.now(TZ).year)
+        return d.replace(hour=23, minute=59, tzinfo=TZ).timestamp()
+    raise ValueError(text)
+
+
+async def set_status(interaction: discord.Interaction, kind: str, reason: str, until: float):
+    uid, nick = str(interaction.user.id), interaction.user.display_name
+    store.statuses[uid] = {"kind": kind, "reason": reason, "until": until, "since": time.time(), "nick": nick}
+    store.save()
+    await sheet_status_log(nick, uid, kind, reason, until)
+
+
+class InactiveModal(discord.ui.Modal, title="Инактив"):
+    reason = discord.ui.TextInput(label="Причина", placeholder="Например: уехал в школу",
+                                  style=discord.TextStyle.paragraph, max_length=200)
+    until = discord.ui.TextInput(label="До какой даты (ДД.ММ.ГГГГ)", placeholder="05.11.2026", max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            until = parse_day_end(self.until.value)
+        except ValueError:
+            await interaction.response.send_message("Дата не распознана. Напиши в формате ДД.ММ.ГГГГ, например 05.11.2026.",
+                                                    ephemeral=True)
+            return
+        if until <= time.time():
+            await interaction.response.send_message("Эта дата уже прошла.", ephemeral=True)
+            return
+        await set_status(interaction, "инактив", self.reason.value.strip(), until)
+        await interaction.response.send_message(
+            f"🛌 Инактив записан до {fmt_dt(until)[:10]}. Проверок нормы в это время не будет. "
+            "Вернуться раньше можно кнопкой «Я вернулся».", ephemeral=True)
+
+
+class AfkModal(discord.ui.Modal, title="АФК"):
+    reason = discord.ui.TextInput(label="Причина", placeholder="Например: отошёл поесть", max_length=200)
+    minutes = discord.ui.TextInput(label="На сколько минут", placeholder="5", max_length=3, default="5")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            mins = int(self.minutes.value.strip())
+            assert 1 <= mins <= 720
+        except (ValueError, AssertionError):
+            await interaction.response.send_message("Минуты напиши числом от 1 до 720.", ephemeral=True)
+            return
+        until = time.time() + mins * 60
+        await set_status(interaction, "афк", self.reason.value.strip(), until)
+        await interaction.response.send_message(
+            f"⏳ АФК на {mins} мин (до {dt.datetime.fromtimestamp(until, TZ):%H:%M}). "
+            "Раньше можно вернуться кнопкой «Я вернулся».", ephemeral=True)
+
+
+class StatusView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Инактив", style=discord.ButtonStyle.secondary, custom_id="status:inactive")
+    async def inactive(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(InactiveModal())
+
+    @discord.ui.button(label="АФК", style=discord.ButtonStyle.secondary, custom_id="status:afk")
+    async def afk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AfkModal())
+
+    @discord.ui.button(label="Я вернулся", style=discord.ButtonStyle.success, custom_id="status:back")
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        st = store.statuses.pop(uid, None)
+        store.save()
+        if st and st["until"] > time.time():
+            await sheet_status_log(interaction.user.display_name, uid, "вернулся", "", 0)
+            await interaction.response.send_message("С возвращением! Статус снят.", ephemeral=True)
+        else:
+            await interaction.response.send_message("У тебя нет активного статуса.", ephemeral=True)
+
+
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # постоянные кнопки, работают после перезапуска
@@ -828,6 +938,7 @@ class Bot(discord.Client):
     async def setup_hook(self):
         self.add_view(PanelView())
         self.add_view(WipeView())
+        self.add_view(StatusView())
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -913,6 +1024,48 @@ async def wipe_panel(interaction: discord.Interaction):
         view=WipeView(),
     )
     await interaction.response.send_message("Кнопка выложена.", ephemeral=True)
+
+
+@bot.tree.command(name="status_panel", description="Выложить кнопки «Инактив» и «АФК» (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def status_panel(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.channel.send(
+        "**Статус**\nНе можешь играть? Нажми «Инактив» (на несколько дней) или «АФК» (отошёл на время) "
+        "и напиши причину. Вернулся раньше, жми «Я вернулся».",
+        view=StatusView(),
+    )
+    await interaction.response.send_message("Кнопки выложены.", ephemeral=True)
+
+
+@bot.tree.command(name="кто_играет", description="Кто сейчас должен играть (для админов)")
+@app_commands.default_permissions(manage_guild=True)
+async def who_plays(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer()
+    profiles = await sheet_players()
+    if not profiles:
+        await interaction.followup.send("В таблице нет игроков с привязанным Discord.")
+        return
+    now = time.time()
+    play, afk, away = [], [], []
+    for uid, p in profiles.items():
+        st = active_status(uid, now)
+        if st and st["kind"] == "инактив":
+            away.append(f"• {p['nick']} до {fmt_dt(st['until'])[:10]}, {st['reason']}")
+        elif st:
+            afk.append(f"• {p['nick']} до {dt.datetime.fromtimestamp(st['until'], TZ):%H:%M}, {st['reason']}")
+        else:
+            play.append(f"• {p['nick']} — " + ("🔊 в гс" if uid in store.open_voice else "не в гс"))
+    lines = [f"**Должны играть: {len(play)}**"] + (play or ["никого"])
+    if afk:
+        lines += [f"**В АФК: {len(afk)}**"] + afk
+    if away:
+        lines += [f"**В инактиве: {len(away)}**"] + away
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, allowed_mentions=NO_PINGS)
 
 
 @bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
