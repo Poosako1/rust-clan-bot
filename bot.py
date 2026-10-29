@@ -24,6 +24,11 @@ REPORT_TIME_UTC = os.environ.get("REPORT_TIME_UTC", "09:00")  # во сколь�
 SERVER_IDS = {s.strip() for s in os.environ.get("SERVER_IDS", "").split(",") if s.strip()}  # пусто = все сервера
 TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "3"))  # часовой пояс для дат вайпа (3 = МСК)
 WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # сколько минут после старта вайпа ещё не опоздание
+OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "").strip()          # ключ OpenRouter (редактор текста, необязательно)
+EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # канал-редактор
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+USE_EDITOR = bool(OPENROUTER_KEY and EDITOR_CHANNEL_ID)
 # ================================
 
 API = "https://api.battlemetrics.com"
@@ -76,6 +81,7 @@ class Store:
         self.open_voice: dict[str, float] = {}
         self.heartbeat: float = time.time()
         self.wipes: dict[str, dict] = {}
+        self.drafts: dict[str, dict] = {}   # id черновика -> {channel_id, text, author_id, ts}
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         if DATA_FILE.exists():
@@ -86,6 +92,7 @@ class Store:
             self.wipes = d.get("wipes", {})
             self.checks = d.get("checks", {})
             self.statuses = d.get("statuses", {})
+            self.drafts = d.get("drafts", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -93,10 +100,12 @@ class Store:
         self.voice = [v for v in self.voice if v[2] >= cutoff]
         self.checks = {k: v for k, v in self.checks.items() if v["rid"] >= cutoff}
         self.statuses = {k: v for k, v in self.statuses.items() if v["until"] >= time.time() - 86400}
+        self.drafts = {k: v for k, v in self.drafts.items() if v["ts"] >= time.time() - 3 * 86400}
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
-                                   "checks": self.checks, "statuses": self.statuses}), encoding="utf-8")
+                                   "checks": self.checks, "statuses": self.statuses,
+                                   "drafts": self.drafts}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -575,6 +584,153 @@ async def apply_check_reaction(bot, payload, added: bool):
                 print(f"Не удалось отправить подтверждение: {short_error(e)}", flush=True)
 
 
+# ---------- редактор текста (OpenRouter) ----------
+EDITOR_SYSTEM = (
+    "Ты редактор текстов для Discord-сервера игрового клана (Rust). Тебе дают текст, оформи его красиво "
+    "в разметке Discord: короткий жирный заголовок при необходимости, абзацы, списки через «•» или «-», "
+    "уместные эмодзи (умеренно), **жирный** для главного. Сохрани смысл, факты, цифры, ники, упоминания "
+    "(<@..>, <@&..>, @everyone) и ссылки без изменений, ничего не выдумывай. Исправь опечатки. Пиши на языке оригинала. "
+    "Не используй заголовки через #, блоки кода и таблицы. Длина результата строго не больше 1700 символов. "
+    "Верни только готовый текст, без пояснений и без кавычек вокруг."
+)
+DRAFT_LIMIT = 1800
+
+
+async def llm_edit(text: str, instruction: str | None = None) -> str:
+    if instruction is None:
+        user = f"Оформи этот текст:\n\n{text}"
+    else:
+        user = (f"Вот текущий вариант текста:\n\n{text}\n\nВнеси правку: {instruction}\n\n"
+                "Верни полный обновлённый текст.")
+    body = {"model": OPENROUTER_MODEL, "temperature": 0.4,
+            "messages": [{"role": "system", "content": EDITOR_SYSTEM}, {"role": "user", "content": user}]}
+    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "X-Title": "rust-clan-bot"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+        async with session.post(OPENROUTER_URL, json=body, headers=headers) as r:
+            data = await r.json(content_type=None)
+            if r.status >= 400:
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                raise RuntimeError(f"OpenRouter {r.status}: {err.get('message') or data}")
+    out = (data["choices"][0]["message"]["content"] or "").strip()
+    if not out:
+        raise RuntimeError("модель вернула пустой ответ")
+    return out
+
+
+def parse_editor_message(message) -> tuple[int | None, str]:
+    """«#канал текст» -> (id канала, текст). Подходит и выбранное из подсказки #канал, и набранное имя."""
+    content = message.content.strip()
+    m = re.match(r"<#(\d+)>\s*(.*)", content, re.S)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+    m = re.match(r"#([^\s]+)\s*(.*)", content, re.S)
+    if m and message.guild is not None:
+        name = m.group(1).lower().strip("#")
+        for ch in message.guild.text_channels:
+            if ch.name.lower() == name:
+                return ch.id, m.group(2).strip()
+    return None, content
+
+
+def draft_text(channel_id: int, text: str) -> str:
+    return f"**Черновик → <#{channel_id}>** (✅ опубликовать, ❌ отменить, или ответь на это сообщение, что изменить)\n\n{text}"
+
+
+async def handle_editor_message(bot, message: discord.Message):
+    if message.reference and str(message.reference.message_id) in store.drafts:  # правка черновика
+        key = str(message.reference.message_id)
+        d = store.drafts[key]
+        async with message.channel.typing():
+            try:
+                new = await llm_edit(d["text"], message.content.strip())
+            except Exception as e:
+                await message.reply(f"⚠️ Не получилось: {short_error(e)}", mention_author=False)
+                return
+        if len(new) > DRAFT_LIMIT:
+            await message.reply("⚠️ Вышло слишком длинно для одного сообщения, попроси сократить.", mention_author=False)
+            return
+        d["text"] = new
+        store.save()
+        try:
+            draft_msg = await message.channel.fetch_message(int(key))
+            await draft_msg.edit(content=draft_text(d["channel_id"], new))
+        except Exception as e:
+            await message.reply(f"⚠️ Не смог обновить черновик: {short_error(e)}", mention_author=False)
+        return
+
+    channel_id, text = parse_editor_message(message)
+    if channel_id is None:
+        await message.reply("Начни сообщение с канала: `#канал текст`. Выбери канал из подсказки после «#».",
+                            mention_author=False)
+        return
+    if not text:
+        await message.reply("После канала нужен текст: `#канал текст`.", mention_author=False)
+        return
+    async with message.channel.typing():
+        try:
+            new = await llm_edit(text)
+        except Exception as e:
+            await message.reply(f"⚠️ Не получилось оформить: {short_error(e)}", mention_author=False)
+            return
+    if len(new) > DRAFT_LIMIT:
+        await message.reply("⚠️ Текст слишком длинный для одного сообщения Discord. Сократи или разбей на части.",
+                            mention_author=False)
+        return
+    draft = await message.reply(draft_text(channel_id, new), mention_author=False,
+                                allowed_mentions=NO_PINGS)
+    store.drafts[str(draft.id)] = {"channel_id": channel_id, "text": new, "author_id": message.author.id,
+                                   "ts": time.time()}
+    store.save()
+    try:
+        for emoji in DECISIONS:
+            await draft.add_reaction(emoji)
+    except Exception as e:
+        print(f"Не удалось поставить реакцию: {short_error(e)}", flush=True)
+        await message.channel.send("⚠️ Не могу ставить реакции: дай боту право «Добавлять реакции».")
+
+
+async def apply_draft_reaction(bot, payload):
+    d = store.drafts.get(str(payload.message_id))
+    emoji = str(payload.emoji)
+    if d is None or emoji not in DECISIONS or payload.user_id == bot.user.id:
+        return
+    member = payload.member
+    is_adm = bool(member and member.guild_permissions.manage_guild)
+    if payload.user_id != d["author_id"] and not is_adm:
+        return
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    try:
+        draft_msg = await channel.fetch_message(payload.message_id)
+    except Exception:
+        return
+    if emoji == "❌":
+        del store.drafts[str(payload.message_id)]
+        store.save()
+        await draft_msg.edit(content="❌ Отменено.\n\n" + d["text"], allowed_mentions=NO_PINGS)
+        return
+    target = bot.get_channel(d["channel_id"])
+    if target is None:
+        try:
+            target = await bot.fetch_channel(d["channel_id"])
+        except Exception:
+            target = None
+    if target is None:
+        await channel.send("⚠️ Не нашёл канал для публикации.")
+        return
+    del store.drafts[str(payload.message_id)]
+    store.save()
+    mentions = discord.AllowedMentions.all() if is_adm else NO_PINGS  # пинги только если подтвердил админ
+    try:
+        await target.send(d["text"], allowed_mentions=mentions)
+    except Exception as e:
+        await channel.send(f"⚠️ Не смог опубликовать в <#{d['channel_id']}>: {short_error(e)}. "
+                           "Проверь права бота в этом канале.")
+        return
+    await draft_msg.edit(content=f"✅ Опубликовано в <#{d['channel_id']}>.\n\n" + d["text"], allowed_mentions=NO_PINGS)
+
+
 # ---------- вайп ----------
 def attendance_label(arrival: float | None, start: float, final: bool) -> tuple[str, int | str]:
     """-> (явка, опоздание в минутах)."""
@@ -944,6 +1100,8 @@ class WipeView(discord.ui.View):
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()  # voice_states входит в default
+        if USE_EDITOR:
+            intents.message_content = True  # нужно включить «Message Content Intent» в портале разработчика
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -973,8 +1131,18 @@ class Bot(discord.Client):
         elif before.channel is not None and after.channel is None:
             store.voice_stop(uid)
 
+    async def on_message(self, message):
+        if not USE_EDITOR or message.author.bot or message.channel.id != EDITOR_CHANNEL_ID:
+            return
+        try:
+            await handle_editor_message(self, message)
+        except Exception as e:
+            print(f"Ошибка редактора: {short_error(e)}", flush=True)
+
     async def on_raw_reaction_add(self, payload):
         await apply_check_reaction(self, payload, added=True)
+        if USE_EDITOR and payload.channel_id == EDITOR_CHANNEL_ID:
+            await apply_draft_reaction(self, payload)
 
     async def on_raw_reaction_remove(self, payload):
         await apply_check_reaction(self, payload, added=False)
