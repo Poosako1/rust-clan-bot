@@ -191,6 +191,24 @@ def active_status(uid: str, now: float | None = None) -> dict | None:
     return st if st and st["until"] > (now or time.time()) else None
 
 
+# ---------- какие привилегированные intents включены в портале разработчика ----------
+def members_intent_enabled() -> bool:
+    """Server Members Intent включён в портале? Проверяем заранее, иначе бот не смог бы войти."""
+    import urllib.request
+    try:
+        req = urllib.request.Request("https://discord.com/api/v10/applications/@me",
+                                     headers={"Authorization": f"Bot {DISCORD_TOKEN}", "User-Agent": "rust-clan-bot"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            flags = json.loads(r.read().decode()).get("flags", 0)
+        return bool(flags & ((1 << 14) | (1 << 15)))  # GATEWAY_GUILD_MEMBERS / _LIMITED
+    except Exception as e:
+        print(f"Не удалось проверить intents: {e}", flush=True)
+        return False
+
+
+MEMBERS_OK = members_intent_enabled()
+
+
 # ---------- таблица через Google Apps Script ----------
 async def sheet_call(payload: dict) -> dict:
     payload = {**payload, "secret": SCRIPT_SECRET}
@@ -1208,6 +1226,7 @@ class Bot(discord.Client):
         intents = discord.Intents.default()  # voice_states входит в default
         if EDITOR_ENABLED and OPENROUTER_KEY:
             intents.message_content = True  # нужно включить «Message Content Intent» в портале разработчика
+        intents.members = MEMBERS_OK  # список участников: кто с ролью клана не заполнил анкету
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -1501,14 +1520,51 @@ async def setup_channels_cmd(interaction: discord.Interaction):
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="registered", description="Кто заполнил анкету, а кто нет (для админов)")
+async def missing_profiles(guild, channel) -> tuple[list, int]:
+    """Все, кто видит приватный канал, но не заполнил профиль (нет в таблице с Discord ID). -> (список, всего)."""
+    profiles = await sheet_players()
+    members = []
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot and channel.permissions_for(m).view_channel:
+            members.append(m)
+    return [m for m in members if str(m.id) not in profiles], len(members)
+
+
+@bot.tree.command(name="registered", description="Кто из приватного канала не заполнил профиль (для админов)")
+@app_commands.describe(channel="Приватный канал клана (по умолчанию #статус)",
+                       notify="Написать в канал и упомянуть тех, кто не заполнил")
 @app_commands.default_permissions(manage_guild=True)
-async def registered(interaction: discord.Interaction):
+async def registered(interaction: discord.Interaction, channel: discord.TextChannel | None = None,
+                     notify: bool = False):
     if not await admin_only(interaction):
         return
-    await interaction.response.defer(ephemeral=True)
-    for chunk in chunk_lines(await registration_report()):
-        await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Бот не видит список участников. В Discord Developer Portal: Bot → Privileged Gateway Intents → "
+            "включи Server Members Intent и перезапусти бота (или подожди автоперезапуск).", ephemeral=True)
+        return
+    channel = channel or interaction.guild.get_channel(cfg_id("status"))
+    if channel is None:
+        await interaction.response.send_message(
+            "Укажи приватный канал клана: /registered channel:#канал", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=not notify)
+    try:
+        missing, total = await missing_profiles(interaction.guild, channel)
+    except Exception as e:
+        await interaction.followup.send(f"Не получилось: {short_error(e)}", ephemeral=True)
+        return
+    head = f"**В #{channel.name}: {total}, заполнили профиль: {total - len(missing)}**"
+    if not missing:
+        await interaction.followup.send(head + "\nВсе заполнили.")
+        return
+    lines = [head, f"**Не заполнили: {len(missing)}**"]
+    lines += [f"• {m.mention}" for m in missing]
+    if notify:
+        lines.append("Нажмите «Мой профиль» в канале анкеты и заполните форму.")
+    allowed = discord.AllowedMentions(users=True) if notify else NO_PINGS
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, allowed_mentions=allowed)
 
 
 @bot.tree.command(name="wipe_status", description="Состояние вайпов и явка прямо сейчас (для админов)")
