@@ -34,6 +34,7 @@ DATA_FILE = BASE / "data.json"
 KEEP_DAYS = 45
 TZ = dt.timezone(dt.timedelta(hours=TZ_OFFSET_HOURS))
 NO_PINGS = discord.AllowedMentions.none()
+STAFF_ROLE_ID = int(os.environ.get("STAFF_ROLE_ID", "0") or 0)  # роль стаффа, её упоминают в тикете (необязательно)
 
 _h, _m = (int(x) for x in REPORT_TIME_UTC.split(":"))
 REPORT_TIME = dt.time(hour=_h, minute=_m, tzinfo=dt.timezone.utc)
@@ -442,7 +443,8 @@ async def post_report(channel: discord.abc.Messageable):
             line = lazy_line(x)
             msg = await channel.send(line, allowed_mentions=NO_PINGS)
             store.checks[str(msg.id)] = {"rid": rid, "uid": x["uid"], "nick": x["nick"], "line": line,
-                                         "decision": "", "by_id": 0}
+                                         "decision": "", "by_id": 0, "ticket": 0,
+                                         "day": (dt.datetime.now(TZ) - dt.timedelta(hours=WINDOW_HOURS)).strftime("%d.%m")}
             store.save()
             try:
                 for emoji in DECISIONS:
@@ -456,6 +458,38 @@ async def post_report(channel: discord.abc.Messageable):
     tail = report_tail(data)
     for chunk in chunk_lines(tail):
         await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+
+async def open_ticket(channel, info: dict, admin) -> None:
+    """❌ «не играл»: приватная ветка с игроком, бот задаёт один вопрос, дальше общаются с стаффом."""
+    if info.get("ticket"):
+        return
+    guild = getattr(channel, "guild", None)
+    member = guild.get_member(int(info["uid"])) if guild else None
+    if member is None and guild is not None:
+        try:
+            member = await guild.fetch_member(int(info["uid"]))
+        except Exception:
+            member = None
+    day = info.get("day") or dt.datetime.fromtimestamp(info["rid"] - WINDOW_HOURS * 3600, TZ).strftime("%d.%m")
+    try:
+        thread = await channel.create_thread(name=f"не играл {day} — {info['nick']}"[:100],
+                                             type=discord.ChannelType.private_thread, invitable=False)
+        info["ticket"] = thread.id
+        store.save()
+        for u in (member, admin):
+            if u is not None:
+                await thread.add_user(u)
+        staff = f"<@&{STAFF_ROLE_ID}> " if STAFF_ROLE_ID else ""
+        who = member.mention if member is not None else f"**{info['nick']}**"
+        await thread.send(f"{who} {staff}\nПочему {day} не играл?",
+                          allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        if member is None:
+            await thread.send("⚠️ Игрока нет на сервере, добавьте его в ветку вручную.")
+    except Exception as e:
+        print(f"Не удалось открыть тикет: {short_error(e)}", flush=True)
+        await channel.send("⚠️ Не смог открыть тикет: нужны права «Создавать приватные ветки», «Управлять ветками» "
+                           "и «Отправлять сообщения в ветках».")
 
 
 async def apply_check_reaction(bot, payload, added: bool):
@@ -495,6 +529,9 @@ async def apply_check_reaction(bot, payload, added: bool):
             await partial.edit(content=text, allowed_mentions=NO_PINGS)
         except Exception as e:
             print(f"Не удалось обновить сообщение: {short_error(e)}", flush=True)
+    if decision and emoji == "❌" and channel is not None:
+        await open_ticket(channel, info, payload.member)
+        store.save()
     # все игроки этой сводки отмечены -> подтверждение
     if decision and channel is not None:
         same = [v for v in store.checks.values() if v["rid"] == info["rid"]]
