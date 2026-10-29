@@ -299,6 +299,13 @@ async def bm_player_name(session, bm_id: int) -> str | None:
         return None
 
 
+def short_error(e: Exception) -> str:
+    """Короткая причина сбоя для показа в чате."""
+    if isinstance(e, aiohttp.ClientResponseError):
+        return f"BattleMetrics ответил {e.status} {e.message}"[:120]
+    return f"{type(e).__name__}: {e}"[:120]
+
+
 def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
     chunks, cur = [], ""
     for line in lines:
@@ -331,13 +338,13 @@ async def build_report() -> list[str]:
                 continue
             # шаг 2: в гс мало — смотрим Rust в BattleMetrics
             if p["bm"] is None:
-                failed.append(uid)
+                failed.append((uid, "нет ссылки BattleMetrics в таблице"))
                 continue
             try:
                 rust = await rust_hours(session, p["bm"], since_dt, now_dt)
             except Exception as e:
-                print(f"BM ошибка для {uid}/{p['bm']}: {e}")
-                failed.append(uid)
+                print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
+                failed.append((uid, short_error(e)))
                 continue
             if rust >= MIN_HOURS:
                 ok += 1
@@ -355,13 +362,17 @@ async def build_report() -> list[str]:
                 extra.append(p["region"])
             extra.append(f"[BM](<https://www.battlemetrics.com/players/{p['bm']}>)")
             lines.append(f"• <@{uid}> ({p['nick']}) — гс {voice:.1f} ч, Rust {rust:.1f} ч · " + " · ".join(extra))
+    elif ok:
+        lines.append(f"✅ За последние {period} все проверенные выполнили норму ({MIN_HOURS:g} ч): {ok}.")
     else:
-        lines.append(f"✅ За последние {period} все проверенные выполнили норму ({MIN_HOURS:g} ч).")
-    if ok:
+        lines.append(f"Проверить не удалось никого, нормы за последние {period} неизвестны.")
+    if ok and lazy:
         lines.append(f"Выполнили норму: {ok}")
     if failed:
-        lines.append("Не удалось проверить (нет ссылки BM или BattleMetrics не ответил): "
-                     + ", ".join(f"<@{u}>" for u in failed))
+        lines.append("Не удалось проверить:")
+        for uid, reason in failed:
+            nick = profiles[uid]["nick"]
+            lines.append(f"• <@{uid}> ({nick}): {reason}")
     return chunk_lines(lines)
 
 
@@ -409,7 +420,7 @@ async def finish_wipe(bot, w: dict):
     try:
         await _finish_wipe(channel, w)
     except Exception as e:
-        print(f"Ошибка подсчёта итогов «{w['name']}»: {e}")
+        print(f"Ошибка подсчёта итогов «{w['name']}»: {e}", flush=True)
         w["status"] = "ошибка итогов"
         store.save()
         await channel.send(f"Не удалось посчитать итоги **{w['name']}**: {e}. Смотри логи бота.")
@@ -431,7 +442,7 @@ async def _finish_wipe(channel, w: dict):
             try:
                 rust[uid] = round(await rust_hours(session, p["bm"], since_dt, end_dt), 1)
             except Exception as e:
-                print(f"BM ошибка для {uid}/{p['bm']}: {e}")
+                print(f"BM ошибка для {uid}/{p['bm']}: {short_error(e)}", flush=True)
                 rust[uid] = ""
 
     rows = await attendance_rows(w, profiles, final=True, now=now, with_rust=rust)
@@ -462,7 +473,7 @@ async def import_wipes_from_sheet():
             store.wipes[name] = {"name": name, "start": parse_dt(r[1]), "end": parse_dt(r[2]),
                                  "status": status, "channel": CHANNEL_ID}
         except ValueError:
-            print(f"вайп «{name}»: не разобрал даты {r[1]!r}, {r[2]!r}")
+            print(f"вайп «{name}»: не разобрал даты {r[1]!r}, {r[2]!r}", flush=True)
     store.save()
 
 
@@ -559,7 +570,7 @@ class ProfileModal(discord.ui.Modal, title="Мой профиль"):
                 str(interaction.user.id), interaction.user.name, bm_id, name,
                 steam, self.region.value.strip(), role, payout))
         except Exception as e:
-            print(f"Ошибка записи в таблицу: {e}")
+            print(f"Ошибка записи в таблицу: {e}", flush=True)
             await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
             return
         how = {"discord": "обновил твою строку", "bm": "нашёл твою строку по ссылке BattleMetrics",
@@ -606,7 +617,7 @@ class WipeModal(discord.ui.Modal, title="Новый вайп"):
         except Exception as e:
             del store.wipes[name]
             store.save()
-            print(f"Ошибка записи вайпа в таблицу: {e}")
+            print(f"Ошибка записи вайпа в таблицу: {e}", flush=True)
             await interaction.followup.send("Не удалось записать вайп в таблицу, скажи админу.", ephemeral=True)
             return
         await interaction.followup.send("Вайп создан.", ephemeral=True)
@@ -656,8 +667,8 @@ class Bot(discord.Client):
         try:
             await import_wipes_from_sheet()
         except Exception as e:
-            print(f"Не удалось прочитать вайпы из таблицы: {e}")
-        print(f"Бот запущен как {self.user}")
+            print(f"Не удалось прочитать вайпы из таблицы: {e}", flush=True)
+        print(f"Бот запущен как {self.user}", flush=True)
 
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
@@ -685,7 +696,7 @@ class Bot(discord.Client):
                 if w["status"] == "идёт" and now >= w["end"]:
                     await finish_wipe(self, w)
             except Exception as e:
-                print(f"Ошибка вайпа «{w['name']}»: {e}")
+                print(f"Ошибка вайпа «{w['name']}»: {e}", flush=True)
 
     @wipe_tick.before_loop
     async def _wait(self):
