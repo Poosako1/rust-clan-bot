@@ -75,20 +75,24 @@ class Store:
         self.open_voice: dict[str, float] = {}
         self.heartbeat: float = time.time()
         self.wipes: dict[str, dict] = {}
+        self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
             self.open_voice = d.get("open_voice", {})
             self.heartbeat = d.get("heartbeat", time.time())
             self.wipes = d.get("wipes", {})
+            self.checks = d.get("checks", {})
 
     def save(self):
         self.heartbeat = time.time()
         cutoff = time.time() - KEEP_DAYS * 86400
         self.voice = [v for v in self.voice if v[2] >= cutoff]
+        self.checks = {k: v for k, v in self.checks.items() if v["rid"] >= cutoff}
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
-                                   "heartbeat": self.heartbeat, "wipes": self.wipes}), encoding="utf-8")
+                                   "heartbeat": self.heartbeat, "wipes": self.wipes,
+                                   "checks": self.checks}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -415,108 +419,82 @@ async def build_report() -> list[str]:
     return chunk_lines([report_header(data)] + [lazy_line(x) for x in data["lazy"]] + report_tail(data))
 
 
-# ---------- кнопки «играл 8ч / не играл 8ч» под сводкой ----------
-DECISIONS = {"yes": "играл 8ч", "no": "не играл 8ч"}
-ROWS_PER_MESSAGE = 5  # у Discord максимум 5 рядов кнопок на сообщение: один игрок на ряд
-
-
-class CheckButton(discord.ui.DynamicItem[discord.ui.Button],
-                  template=r"chk:(?P<v>yes|no):(?P<rid>\d+):(?P<uid>\d+)"):
-    """Постоянная кнопка: custom_id хранит решение, номер отчёта и Discord ID игрока."""
-
-    def __init__(self, v: str, rid: int, uid: str, row: int, *, chosen: bool = False):
-        style = (discord.ButtonStyle.success if v == "yes" else discord.ButtonStyle.danger) if chosen \
-            else discord.ButtonStyle.secondary
-        button = discord.ui.Button(label=("✅ " if v == "yes" else "❌ ") + DECISIONS[v], style=style,
-                                   custom_id=f"chk:{v}:{rid}:{uid}", disabled=chosen, row=row)
-        super().__init__(button)
-        self.v, self.rid, self.uid = v, rid, uid
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
-        return cls(match["v"], int(match["rid"]), match["uid"], row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Отмечать могут только админы.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        nick = nick_from_message(interaction.message, self.uid)
-        try:
-            await sheet_check_set(fmt_dt(self.rid), self.uid, nick, DECISIONS[self.v], interaction.user.name)
-        except Exception as e:
-            print(f"Ошибка записи решения: {short_error(e)}", flush=True)
-            await interaction.followup.send("Не удалось записать в таблицу, скажи админу.", ephemeral=True)
-            return
-        await interaction.edit_original_response(view=rebuild_view(interaction.message, self.uid, self.v))
-
-
-def nick_from_message(message: discord.Message, uid: str) -> str:
-    for row in message.components:
-        kids = getattr(row, "children", [])
-        if len(kids) == 3 and kids[1].custom_id.endswith(f":{uid}"):
-            return kids[0].label.split(" — ")[0]
-    return ""
-
-
-def player_row(i: int, nick: str, rid: int, uid: str, decision: str | None) -> list[discord.ui.Item]:
-    label = f"{nick[:50]} — {'✅' if decision == 'yes' else '❌'} {DECISIONS[decision]}" if decision else nick[:70]
-    name = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, disabled=True,
-                             custom_id=f"chk:name:{rid}:{uid}", row=i)
-    return [name, CheckButton("yes", rid, uid, i, chosen=decision == "yes"),
-            CheckButton("no", rid, uid, i, chosen=decision == "no")]
-
-
-def rebuild_view(message: discord.Message, pressed_uid: str, decision: str) -> discord.ui.View:
-    """Собрать кнопки заново: у нажатого игрока выбранное решение подсвечено, остальные ряды как были."""
-    view = discord.ui.View(timeout=None)
-    for i, row in enumerate(message.components):
-        kids = getattr(row, "children", [])
-        if len(kids) != 3:
-            continue
-        uid = kids[1].custom_id.rsplit(":", 1)[1]
-        rid = int(kids[1].custom_id.split(":")[2])
-        nick = kids[0].label.split(" — ")[0]
-        if uid == pressed_uid:
-            state = decision
-        else:
-            state = "yes" if kids[1].disabled else ("no" if kids[2].disabled else None)
-        for item in player_row(i, nick, rid, uid, state):
-            view.add_item(item)
-    return view
+# ---------- отметки ✅ / ❌ под игроками сводки ----------
+DECISIONS = {"✅": "играл 8ч", "❌": "не играл 8ч"}
 
 
 async def post_report(channel: discord.abc.Messageable):
-    """Выложить сводку: ник, ссылка BM и две кнопки рядом с каждым игроком."""
+    """Выложить сводку: каждый игрок отдельным сообщением (ник, часы в гс, ссылка BM), под ним ✅ и ❌."""
     data = await compute_report()
     if data["empty"]:
         await channel.send(data["empty"], allowed_mentions=NO_PINGS)
         return
     lazy = data["lazy"]
-    if not lazy:
-        for chunk in chunk_lines([report_header(data)] + report_tail(data)):
-            await channel.send(chunk, allowed_mentions=NO_PINGS)
-        return
-
-    rid = int(time.time())
-    warn = ""
-    try:
-        await sheet_checks_add(fmt_dt(rid), [(x["uid"], x["nick"], x["voice"]) for x in lazy])
-    except Exception as e:
-        print(f"Ошибка записи в лист проверок: {short_error(e)}", flush=True)
-        warn = "\n⚠️ Не удалось записать в лист «проверки», решения могут не сохраниться."
-    for k in range(0, len(lazy), ROWS_PER_MESSAGE):
-        group = lazy[k:k + ROWS_PER_MESSAGE]
-        lines = ([report_header(data)] if k == 0 else []) + [lazy_line(x) for x in group]
-        view = discord.ui.View(timeout=None)
-        for i, x in enumerate(group):
-            for item in player_row(i, x["nick"], rid, x["uid"], None):
-                view.add_item(item)
-        await channel.send("\n".join(lines) + (warn if k == 0 else ""), view=view, allowed_mentions=NO_PINGS)
+    await channel.send(report_header(data), allowed_mentions=NO_PINGS)
+    if lazy:
+        rid = int(time.time())
+        try:
+            await sheet_checks_add(fmt_dt(rid), [(x["uid"], x["nick"], x["voice"]) for x in lazy])
+        except Exception as e:
+            print(f"Ошибка записи в лист проверок: {short_error(e)}", flush=True)
+            await channel.send("⚠️ Не удалось записать в лист «проверки», отметки могут не сохраниться.")
+        for x in lazy:
+            line = lazy_line(x)
+            msg = await channel.send(line, allowed_mentions=NO_PINGS)
+            store.checks[str(msg.id)] = {"rid": rid, "uid": x["uid"], "nick": x["nick"], "line": line,
+                                         "decision": "", "by_id": 0}
+            store.save()
+            try:
+                for emoji in DECISIONS:
+                    await msg.add_reaction(emoji)
+            except Exception as e:  # чаще всего у бота нет права «Добавлять реакции»
+                print(f"Не удалось поставить реакцию: {short_error(e)}", flush=True)
+                await channel.send("⚠️ Не могу ставить реакции: дай боту право «Добавлять реакции» "
+                                   "и «Читать историю сообщений» в этом канале.")
+                break
+            await asyncio.sleep(0.3)
     tail = report_tail(data)
-    if tail:
-        for chunk in chunk_lines(tail):
-            await channel.send(chunk, allowed_mentions=NO_PINGS)
+    for chunk in chunk_lines(tail):
+        await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+
+async def apply_check_reaction(bot, payload, added: bool):
+    """Админ поставил ✅ или ❌ под игроком: записать решение в таблицу и показать его в сообщении."""
+    info = store.checks.get(str(payload.message_id))
+    emoji = str(payload.emoji)
+    if info is None or emoji not in DECISIONS or payload.user_id == bot.user.id:
+        return
+    channel = bot.get_channel(payload.channel_id)
+    partial = channel.get_partial_message(payload.message_id) if channel else None
+
+    if added:
+        member = payload.member
+        if member is None or not member.guild_permissions.manage_guild:
+            try:  # реакцию не админа убираем (нужно право «Управлять сообщениями», иначе просто игнорируем)
+                if partial is not None and member is not None:
+                    await partial.remove_reaction(emoji, member)
+            except Exception:
+                pass
+            return
+        decision, who = DECISIONS[emoji], member.name
+        info["decision"], info["by_id"] = emoji, payload.user_id
+    else:  # админ снял свою отметку: решение очищаем
+        if info["decision"] != emoji or info["by_id"] != payload.user_id:
+            return
+        decision, who = "", ""
+        info["decision"], info["by_id"] = "", 0
+    store.save()
+    try:
+        await sheet_check_set(fmt_dt(info["rid"]), info["uid"], info["nick"], decision, who)
+    except Exception as e:
+        print(f"Ошибка записи решения: {short_error(e)}", flush=True)
+        return
+    if partial is not None:
+        text = info["line"] + (f" → {emoji} {decision} ({who})" if decision else "")
+        try:
+            await partial.edit(content=text, allowed_mentions=NO_PINGS)
+        except Exception as e:
+            print(f"Не удалось обновить сообщение: {short_error(e)}", flush=True)
 
 
 # ---------- вайп ----------
@@ -798,7 +776,6 @@ class Bot(discord.Client):
     async def setup_hook(self):
         self.add_view(PanelView())
         self.add_view(WipeView())
-        self.add_dynamic_items(CheckButton)
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -820,6 +797,12 @@ class Bot(discord.Client):
             store.voice_start(uid)
         elif before.channel is not None and after.channel is None:
             store.voice_stop(uid)
+
+    async def on_raw_reaction_add(self, payload):
+        await apply_check_reaction(self, payload, added=True)
+
+    async def on_raw_reaction_remove(self, payload):
+        await apply_check_reaction(self, payload, added=False)
 
     @tasks.loop(time=REPORT_TIME)
     async def daily_report(self):
