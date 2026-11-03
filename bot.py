@@ -28,7 +28,7 @@ WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # скольк�
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "").strip()          # ключ OpenRouter (редактор текста, необязательно)
 EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # канал-редактор
 EDITOR_ENABLED = os.environ.get("EDITOR_ENABLED", "0") == "1"   # редактор текста выключен, пока не включён явно
-INVITE_LOG_CHANNEL_ID = int(os.environ.get("INVITE_LOG_CHANNEL_ID", "0") or 0)  # канал модераторского лога удалённых инвайтов
+INVITE_LOG_CHANNEL_ID = int(os.environ.get("INVITE_LOG_CHANNEL_ID", "1516857380221227030") or 1516857380221227030)  # канал модераторского лога удалённых инвайтов
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 # ================================
