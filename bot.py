@@ -28,6 +28,7 @@ WIPE_GRACE_MIN = float(os.environ.get("WIPE_GRACE_MIN", "5"))    # скольк�
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "").strip()          # ключ OpenRouter (редактор текста, необязательно)
 EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # канал-редактор
 EDITOR_ENABLED = os.environ.get("EDITOR_ENABLED", "0") == "1"   # редактор текста выключен, пока не включён явно
+INVITE_LOG_CHANNEL_ID = int(os.environ.get("INVITE_LOG_CHANNEL_ID", "0") or 0)  # канал модераторского лога удалённых инвайтов
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 # ================================
@@ -1247,6 +1248,53 @@ class Bot(discord.Client):
         except Exception as e:
             print(f"Не удалось прочитать вайпы из таблицы: {e}", flush=True)
         print(f"Бот запущен как {self.user}", flush=True)
+
+    async def on_invite_delete(self, invite):
+        """Логировать удаление инвайта в закрытый канал; исполнитель берётся из Audit Log."""
+        channel_id = INVITE_LOG_CHANNEL_ID
+        guild = getattr(invite, "guild", None)
+        if not channel_id or guild is None:
+            return
+
+        code = getattr(invite, "code", None) or "неизвестный код"
+        executor = None
+        # Discord может задержать запись в Audit Log относительно gateway-события.
+        for attempt in range(5):
+            try:
+                async for entry in guild.audit_logs(
+                    limit=10, action=discord.AuditLogAction.invite_delete
+                ):
+                    target = getattr(entry, "target", None)
+                    target_code = getattr(target, "code", None)
+                    if target_code == code and (dt.datetime.now(dt.timezone.utc) - entry.created_at).total_seconds() <= 20:
+                        executor = entry.user
+                        break
+                if executor is not None:
+                    break
+            except discord.Forbidden:
+                print("Не могу читать Audit Log для удаления инвайтов: нет права «Просмотр журнала аудита».", flush=True)
+                break
+            except Exception as e:
+                print(f"Ошибка чтения Audit Log для invite delete: {short_error(e)}", flush=True)
+            if attempt < 4:
+                await asyncio.sleep(1)
+
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except Exception as e:
+                print(f"Не найден канал лога инвайтов {channel_id}: {short_error(e)}", flush=True)
+                return
+
+        if executor is not None:
+            text = f"🛡️ Модератор **{discord.utils.escape_markdown(executor.display_name)}** удалил ссылку-приглашение `{code}`."
+        else:
+            text = f"⚠️ Ссылка-приглашение `{code}` удалена/истекла, но Discord не предоставил исполнителя в Audit Log."
+        try:
+            await channel.send(text, allowed_mentions=NO_PINGS)
+        except Exception as e:
+            print(f"Не удалось отправить лог удаления инвайта: {short_error(e)}", flush=True)
 
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
