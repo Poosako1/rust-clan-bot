@@ -1287,6 +1287,11 @@ class Bot(discord.Client):
                 print(f"Не найден канал лога инвайтов {channel_id}: {short_error(e)}", flush=True)
                 return
 
+        # Не отправлять события других серверов в канал лога CL Community.
+        channel_guild = getattr(channel, "guild", None)
+        if channel_guild is None or channel_guild.id != guild.id:
+            return
+
         if executor is not None:
             text = f"🛡️ Модератор **{discord.utils.escape_markdown(executor.display_name)}** удалил ссылку-приглашение `{code}`."
         else:
