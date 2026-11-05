@@ -1553,6 +1553,7 @@ async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None
         description=settings["description"],
         colour=settings["color"],
     )
+    embed.set_footer(text="CL Team")
     try:
         await interaction.channel.send(
             embed=embed,
