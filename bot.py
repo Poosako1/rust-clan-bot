@@ -1454,8 +1454,8 @@ def can_close_ticket(interaction: discord.Interaction) -> bool:
     topic = channel.topic or ""
     if not topic.startswith("ticket:"):
         return False
-    match = re.search(r"(?:^| )owner:(\d+)(?: |$)", topic)
-    return bool(is_staff_member(interaction.user) or (match and int(match.group(1)) == interaction.user.id))
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
 
 
 def ticket_log_overwrites(guild: discord.Guild) -> dict:
@@ -1579,13 +1579,11 @@ async def grant_accepted_ticket_roles(channel: discord.TextChannel) -> tuple[boo
 
 
 class TicketCloseConfirmView(discord.ui.View):
-    def __init__(self, user_id: int, reason: str = "Закрыт", accepted: bool = False,
-                 staff_only: bool = False):
+    def __init__(self, user_id: int, reason: str = "Закрыт", accepted: bool = False):
         super().__init__(timeout=60)
         self.user_id = user_id
         self.reason = reason
         self.accepted = accepted
-        self.staff_only = staff_only
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.user_id:
@@ -1597,8 +1595,7 @@ class TicketCloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Закрыть", style=discord.ButtonStyle.danger, custom_id="ticket:close:confirm")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
-        allowed = is_staff_member(interaction.user) if self.staff_only else can_close_ticket(interaction)
-        if not allowed or not isinstance(channel, discord.TextChannel):
+        if not can_close_ticket(interaction) or not isinstance(channel, discord.TextChannel):
             await interaction.response.edit_message(content="У тебя нет права закрыть этот тикет.", view=None)
             return
         await interaction.response.defer(ephemeral=True)
@@ -1643,8 +1640,8 @@ class TicketApplicationCloseView(discord.ui.View):
         self.add_item(self.reason_select)
 
     async def select_reason(self, interaction: discord.Interaction):
-        if not is_staff_member(interaction.user):
-            await interaction.response.send_message("Причину закрытия выбирает только администрация.",
+        if not can_close_ticket(interaction):
+            await interaction.response.send_message("Закрыть тикет может только участник с правом «Администратор».",
                                                     ephemeral=True)
             return
         reason_key = self.reason_select.values[0]
@@ -1652,7 +1649,7 @@ class TicketApplicationCloseView(discord.ui.View):
         await interaction.response.send_message(
             f"Закрыть тикет с причиной «{reason}»?",
             view=TicketCloseConfirmView(interaction.user.id, reason=reason,
-                                        accepted=reason_key == "accepted", staff_only=True),
+                                        accepted=reason_key == "accepted"),
             ephemeral=True,
         )
 
@@ -1664,7 +1661,7 @@ class TicketCloseView(discord.ui.View):
     @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.danger, custom_id="ticket:close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_close_ticket(interaction):
-            await interaction.response.send_message("Закрыть тикет может его автор или администрация.",
+            await interaction.response.send_message("Закрыть тикет может только участник с правом «Администратор».",
                                                     ephemeral=True)
             return
         await interaction.response.send_message("Точно закрыть и удалить этот тикет?",
