@@ -1268,7 +1268,7 @@ TICKET_TYPES = {
         "panel_title": "ПОДДЕРЖКА",
         "title": "Поддержка сервера",
         "description": "Возник вопрос или нужна помощь? Создай тикет и подробно опиши ситуацию. Тебе помогут.",
-        "welcome": "Опиши всю ситуацию и ожидай ответа.",
+        "welcome": "",
         "style": discord.ButtonStyle.secondary,
     },
 }
@@ -1371,7 +1371,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         staff_mention = f" {staff.mention}" if staff is not None else ""
         embed = discord.Embed(
             title=f"{settings['emoji']} {settings['title']} — #{number}",
-            description=settings["welcome"],
+            description=settings["welcome"] or None,
             colour=settings["color"],
         )
         embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
@@ -1381,6 +1381,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
             embed=embed,
+            view=TicketCloseView(),
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
         await interaction.followup.send(f"Тикет создан: {channel.mention}", ephemeral=True)
@@ -1420,6 +1421,64 @@ class TicketPanelView(discord.ui.View):
         await create_ticket(interaction, self.kind, self.role_select.values[0])
 
 
+def can_close_ticket(interaction: discord.Interaction) -> bool:
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    topic = channel.topic or ""
+    if not topic.startswith("ticket:"):
+        return False
+    match = re.search(r"(?:^| )owner:(\d+)(?: |$)", topic)
+    return bool(is_staff_member(interaction.user) or (match and int(match.group(1)) == interaction.user.id))
+
+
+class TicketCloseConfirmView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Подтвердить закрытие может только тот, кто нажал кнопку.",
+                                                ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Закрыть", style=discord.ButtonStyle.danger, custom_id="ticket:close:confirm")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        if not can_close_ticket(interaction) or not isinstance(channel, discord.TextChannel):
+            await interaction.response.edit_message(content="У тебя нет права закрыть этот тикет.", view=None)
+            return
+        await interaction.response.edit_message(content="Тикет закрывается…", view=None)
+        await asyncio.sleep(1)
+        try:
+            await channel.delete(reason=f"Тикет закрыт пользователем {interaction.user}")
+        except Exception as e:
+            try:
+                await interaction.edit_original_response(content=f"Не получилось закрыть тикет: {short_error(e)}")
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary, custom_id="ticket:close:cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Закрытие отменено.", view=None)
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.danger, custom_id="ticket:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_close_ticket(interaction):
+            await interaction.response.send_message("Закрыть тикет может его автор или администрация.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_message("Точно закрыть и удалить этот тикет?",
+                                                view=TicketCloseConfirmView(interaction.user.id), ephemeral=True)
+
+
 # ---------- бот ----------
 class Bot(discord.Client):
     def __init__(self):
@@ -1436,6 +1495,7 @@ class Bot(discord.Client):
         self.add_view(WipeView())
         self.add_view(StatusView())
         self.add_view(AdminView())
+        self.add_view(TicketCloseView())
         for kind in TICKET_TYPES:
             self.add_view(TicketPanelView(kind))
         await self.tree.sync()
