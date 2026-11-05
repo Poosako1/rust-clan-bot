@@ -1268,7 +1268,7 @@ TICKET_TYPES = {
         "panel_title": "ПОДДЕРЖКА",
         "title": "Поддержка сервера",
         "description": "Возник вопрос или нужна помощь? Создай тикет и подробно опиши ситуацию. Тебе помогут.",
-        "welcome": "",
+        "welcome": "Опиши всю ситуацию и ожидай ответа.",
         "style": discord.ButtonStyle.secondary,
     },
 }
@@ -1377,7 +1377,6 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
         if selected_role:
             embed.add_field(name="Направление", value=ticket_role_label(selected_role), inline=True)
-        embed.add_field(name="Статус", value="🟢 Ожидает ответа", inline=True)
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
             embed=embed,
