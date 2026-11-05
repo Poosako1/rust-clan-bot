@@ -1275,16 +1275,24 @@ TICKET_TYPES = {
     },
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
-TICKET_ROLES = ["коллер", "комбат", "фермер", "электрик", "крафтер", "пилот", "fpv-пилот", "билдер"]
+TICKET_ROLES = ["коллер", "комбат", "fpv-пилот", "пилот", "электрик", "фермер", "билдер"]
 TICKET_ROLE_SLUGS = {
     "коллер": "coller",
     "комбат": "combat",
-    "фермер": "farmer",
-    "электрик": "electric",
-    "крафтер": "crafter",
-    "пилот": "pilot",
     "fpv-пилот": "fpv",
+    "пилот": "pilot",
+    "электрик": "electric",
+    "фермер": "farmer",
     "билдер": "builder",
+}
+TICKET_MAIN_REQUIREMENTS = {
+    "коллер": ("8к", 16),
+    "комбат": ("3к", 15),
+    "fpv-пилот": ("2.5к", 15),
+    "пилот": ("3к", 15),
+    "электрик": ("3к", 15),
+    "фермер": ("2к", 15),
+    "билдер": ("3к", 15),
 }
 
 
@@ -1295,8 +1303,8 @@ def ticket_role_label(role: str) -> str:
 def ticket_role_option(role: str, kind: str) -> discord.SelectOption:
     description = None
     if kind == "main":
-        hours = "8к" if role == "коллер" else "4к"
-        description = f"От {hours} часов · only x3d"
+        hours, age = TICKET_MAIN_REQUIREMENTS[role]
+        description = f"От {hours} часов · от {age} лет · only x3d"
     return discord.SelectOption(label=ticket_role_label(role), value=role, description=description)
 
 
