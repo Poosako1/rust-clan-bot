@@ -1971,7 +1971,10 @@ async def ticket_roles(interaction: discord.Interaction, coller: discord.Role | 
     lines = ["**Роли для принятых анкет:**"]
     for key, label in labels.items():
         role = interaction.guild.get_role(cfg_id(key))
-        lines.append(f"• {label}: {role.mention if role else 'не настроена'}")
+        if role is not None:
+            lines.append(f"• {label}: {role.mention}")
+    if len(lines) == 1:
+        lines.append("Настроенных ролей пока нет.")
     if changed:
         lines.insert(0, "Настройки сохранены.\n")
     await interaction.response.send_message("\n".join(lines), ephemeral=True, allowed_mentions=NO_PINGS)
