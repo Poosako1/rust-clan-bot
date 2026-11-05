@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import time
 import asyncio
@@ -206,6 +207,23 @@ def members_intent_enabled() -> bool:
 
 
 MEMBERS_OK = members_intent_enabled()
+
+
+def message_content_intent_enabled() -> bool:
+    """Message Content Intent включён в портале разработчика?"""
+    import urllib.request
+    try:
+        req = urllib.request.Request("https://discord.com/api/v10/applications/@me",
+                                     headers={"Authorization": f"Bot {DISCORD_TOKEN}", "User-Agent": "rust-clan-bot"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            flags = json.loads(r.read().decode()).get("flags", 0)
+        return bool(flags & ((1 << 18) | (1 << 19)))  # GATEWAY_MESSAGE_CONTENT / _LIMITED
+    except Exception as e:
+        print(f"Не удалось проверить Message Content Intent: {e}", flush=True)
+        return False
+
+
+MESSAGE_CONTENT_OK = message_content_intent_enabled()
 
 
 # ---------- таблица через Google Apps Script ----------
@@ -1431,6 +1449,102 @@ def can_close_ticket(interaction: discord.Interaction) -> bool:
     return bool(is_staff_member(interaction.user) or (match and int(match.group(1)) == interaction.user.id))
 
 
+def ticket_log_overwrites(guild: discord.Guild) -> dict:
+    P = discord.PermissionOverwrite
+    access = P(view_channel=True, send_messages=True, read_message_history=True, attach_files=True,
+               embed_links=True)
+    overwrites = {guild.default_role: P(view_channel=False)}
+    if guild.me is not None:
+        overwrites[guild.me] = access
+    staff = guild.get_role(staff_role_id())
+    if staff is not None:
+        overwrites[staff] = access
+    for role in guild.roles:
+        if not role.is_default() and (role.permissions.administrator or role.permissions.manage_guild):
+            overwrites[role] = access
+    return overwrites
+
+
+async def ensure_ticket_log_channels(guild: discord.Guild, category=None) -> list[discord.TextChannel]:
+    channels = []
+    for key, name in (("ticket_support_logs", "логи-поддержки"),
+                      ("ticket_application_logs", "логи-анкет")):
+        channel = guild.get_channel(cfg_id(key)) or discord.utils.get(guild.text_channels, name=name)
+        if channel is None:
+            channel = await guild.create_text_channel(
+                name, category=category, overwrites=ticket_log_overwrites(guild),
+                reason="Логи тикетов CL Team",
+            )
+        else:
+            for target, overwrite in ticket_log_overwrites(guild).items():
+                await channel.set_permissions(target, overwrite=overwrite,
+                                              reason="Настройка доступа к логам тикетов")
+        store.cfg[key] = channel.id
+        channels.append(channel)
+    store.save()
+    return channels
+
+
+async def save_ticket_transcript(channel: discord.TextChannel, closer) -> tuple[bool, str]:
+    if not MESSAGE_CONTENT_OK:
+        return False, ("В Discord Developer Portal включи Bot → Privileged Gateway Intents → "
+                       "Message Content Intent и перезапусти бота.")
+    topic = channel.topic or ""
+    match = re.search(r"^ticket:(main|second|support) owner:(\d+)", topic)
+    if not match:
+        return False, "Не удалось определить тип и автора тикета."
+    kind, owner_id = match.group(1), int(match.group(2))
+    log_key = "ticket_support_logs" if kind == "support" else "ticket_application_logs"
+    log_name = "логи-поддержки" if kind == "support" else "логи-анкет"
+    log_channel = channel.guild.get_channel(cfg_id(log_key)) or discord.utils.get(
+        channel.guild.text_channels, name=log_name)
+    if not isinstance(log_channel, discord.TextChannel):
+        try:
+            created = await ensure_ticket_log_channels(channel.guild, channel.category)
+            log_channel = created[0] if kind == "support" else created[1]
+        except Exception as e:
+            return False, f"Не удалось создать каналы логов: {short_error(e)}"
+
+    messages = [m async for m in channel.history(limit=None, oldest_first=True)]
+    lines = [f"Тикет: #{channel.name}", f"ID канала: {channel.id}", ""]
+    for message in messages:
+        stamp = message.created_at.astimezone(TZ).strftime("%d.%m.%Y %H:%M:%S")
+        author = f"{message.author} ({message.author.id})"
+        content = message.content.strip()
+        if content:
+            lines.append(f"[{stamp}] {author}: {content}")
+        else:
+            lines.append(f"[{stamp}] {author}: [сообщение без текста]")
+        for attachment in message.attachments:
+            lines.append(f"  Вложение: {attachment.filename} — {attachment.url}")
+        for embed in message.embeds:
+            embed_text = " — ".join(x for x in (embed.title, embed.description) if x)
+            if embed_text:
+                lines.append(f"  Embed: {embed_text}")
+            for field in embed.fields:
+                lines.append(f"  {field.name}: {field.value}")
+
+    transcript = "\n".join(lines).encode("utf-8")
+    owner = channel.guild.get_member(owner_id)
+    kind_label = {"main": "Анкета в Мейн", "second": "Анкета во второй состав",
+                  "support": "Поддержка"}[kind]
+    summary = discord.Embed(title=f"Закрыт тикет #{channel.name}", colour=0xED4245)
+    summary.add_field(name="Тип", value=kind_label, inline=True)
+    summary.add_field(name="Автор", value=owner.mention if owner else f"<@{owner_id}>", inline=True)
+    summary.add_field(name="Закрыл", value=closer.mention, inline=True)
+    summary.add_field(name="Сообщений", value=str(len(messages)), inline=True)
+    summary.set_footer(text="CL Team")
+    try:
+        await log_channel.send(
+            embed=summary,
+            file=discord.File(io.BytesIO(transcript), filename=f"transcript-{channel.name}.txt"),
+            allowed_mentions=NO_PINGS,
+        )
+    except Exception as e:
+        return False, f"Не удалось сохранить лог: {short_error(e)}"
+    return True, f"Лог сохранён в {log_channel.mention}."
+
+
 class TicketCloseConfirmView(discord.ui.View):
     def __init__(self, user_id: int):
         super().__init__(timeout=60)
@@ -1449,7 +1563,12 @@ class TicketCloseConfirmView(discord.ui.View):
         if not can_close_ticket(interaction) or not isinstance(channel, discord.TextChannel):
             await interaction.response.edit_message(content="У тебя нет права закрыть этот тикет.", view=None)
             return
-        await interaction.response.edit_message(content="Тикет закрывается…", view=None)
+        await interaction.response.defer(ephemeral=True)
+        saved, detail = await save_ticket_transcript(channel, interaction.user)
+        if not saved:
+            await interaction.edit_original_response(content=f"Тикет не закрыт. {detail}", view=None)
+            return
+        await interaction.edit_original_response(content=f"{detail} Тикет закрывается…", view=None)
         await asyncio.sleep(1)
         try:
             await channel.delete(reason=f"Тикет закрыт пользователем {interaction.user}")
@@ -1482,8 +1601,7 @@ class TicketCloseView(discord.ui.View):
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()  # voice_states входит в default
-        if EDITOR_ENABLED and OPENROUTER_KEY:
-            intents.message_content = True  # нужно включить «Message Content Intent» в портале разработчика
+        intents.message_content = MESSAGE_CONTENT_OK  # нужен для полной переписки в логах тикетов
         intents.members = MEMBERS_OK  # список участников: кто с ролью клана не заполнил анкету
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
@@ -1717,6 +1835,24 @@ async def support_panel(interaction: discord.Interaction):
     await send_ticket_panel(interaction, "support")
 
 
+@bot.tree.command(name="ticket_logs_setup", description="Создать два закрытых канала логов тикетов")
+@app_commands.default_permissions(manage_guild=True)
+async def ticket_logs_setup(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        channels = await ensure_ticket_log_channels(
+            interaction.guild, getattr(interaction.channel, "category", None))
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не получилось создать каналы логов: {short_error(e)}. Нужны права «Управлять каналами».",
+            ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"Готово: {channels[0].mention} и {channels[1].mention}.", ephemeral=True)
+
+
 async def send_who_plays(interaction: discord.Interaction):
     """Список: кто сейчас должен играть (ответ в канал)."""
     await interaction.response.defer()
@@ -1760,6 +1896,8 @@ CHANNEL_PLAN = [
     ("status", "статус", "clan", False, (TEXT_STATUS, StatusView)),
     *([("editor", "редактор", "staff", True, None)] if EDITOR_ENABLED else []),
     ("admin", "админ-панель", "staff", False, (TEXT_ADMIN, AdminView)),
+    ("ticket_support_logs", "логи-поддержки", "staff", True, None),
+    ("ticket_application_logs", "логи-анкет", "staff", True, None),
 ]
 
 
