@@ -88,6 +88,8 @@ class Store:
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         self.ticket_counters: dict[str, int] = {}  # guild_id:тип -> последний номер тикета
+        self.ticket_roles: dict[str, list[str]] = {}  # guild_id:состав -> открытые направления
+        self.ticket_panels: dict[str, dict] = {}  # guild_id:тип -> {channel_id, message_id}
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -99,6 +101,8 @@ class Store:
             self.drafts = d.get("drafts", {})
             self.cfg = d.get("cfg", {})
             self.ticket_counters = d.get("ticket_counters", {})
+            self.ticket_roles = d.get("ticket_roles", {})
+            self.ticket_panels = d.get("ticket_panels", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -112,7 +116,9 @@ class Store:
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
                                    "checks": self.checks, "statuses": self.statuses,
                                    "drafts": self.drafts, "cfg": self.cfg,
-                                   "ticket_counters": self.ticket_counters}), encoding="utf-8")
+                                   "ticket_counters": self.ticket_counters,
+                                   "ticket_roles": self.ticket_roles,
+                                   "ticket_panels": self.ticket_panels}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -1287,6 +1293,54 @@ def ticket_role_label(role: str) -> str:
     return "FPV-пилот" if role == "fpv-пилот" else role.capitalize()
 
 
+def ticket_roles_key(guild_id: int, kind: str) -> str:
+    return f"{guild_id}:{kind}"
+
+
+def active_ticket_roles(guild_id: int | None, kind: str) -> list[str]:
+    if guild_id is None:
+        return list(TICKET_ROLES)
+    saved = store.ticket_roles.get(ticket_roles_key(guild_id, kind))
+    if saved is None:
+        return list(TICKET_ROLES)
+    return [role for role in TICKET_ROLES if role in saved]
+
+
+def ticket_panel_embed(kind: str, guild_id: int | None = None) -> discord.Embed:
+    settings = TICKET_TYPES[kind]
+    description = settings["description"]
+    if kind in ("main", "second") and not active_ticket_roles(guild_id, kind):
+        description += "\n\n🔴 **Набор по направлениям временно закрыт.**"
+    embed = discord.Embed(
+        title=f"{settings['emoji']} {settings['panel_title']}",
+        description=description,
+        colour=settings["color"],
+    )
+    embed.set_author(name="CL TEAM • ПОДАТЬ ЗАЯВКУ" if kind != "support" else "CL TEAM • ПОДДЕРЖКА")
+    embed.set_footer(text="CL Team")
+    return embed
+
+
+async def refresh_ticket_panel(client: discord.Client, guild: discord.Guild, kind: str) -> bool:
+    ref = store.ticket_panels.get(ticket_roles_key(guild.id, kind))
+    if not ref:
+        return False
+    try:
+        channel_id = int(ref["channel_id"])
+        channel = guild.get_channel(channel_id) or client.get_channel(channel_id)
+        if channel is None:
+            channel = await client.fetch_channel(channel_id)
+        message = await channel.fetch_message(int(ref["message_id"]))
+        await message.edit(embed=ticket_panel_embed(kind, guild.id),
+                           view=TicketPanelView(kind, guild.id))
+        return True
+    except (discord.NotFound, discord.Forbidden):
+        return False
+    except Exception as e:
+        print(f"Не удалось обновить панель {kind}: {short_error(e)}", flush=True)
+        return False
+
+
 def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
     """Доступ к тикету: автор, бот, настроенный стафф и административные роли."""
     P = discord.PermissionOverwrite
@@ -1324,6 +1378,9 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     settings = TICKET_TYPES[kind]
+    if selected_role and selected_role not in active_ticket_roles(guild.id, kind):
+        await interaction.followup.send("Это направление сейчас закрыто для набора.", ephemeral=True)
+        return
     lock_key = f"{guild.id}:{kind}"
     lock = _ticket_locks.setdefault(lock_key, asyncio.Lock())
     try:
@@ -1365,23 +1422,27 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
 
 
 class TicketPanelView(discord.ui.View):
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, guild_id: int | None = None):
         super().__init__(timeout=None)
         self.kind = kind
         settings = TICKET_TYPES[kind]
         if kind in ("main", "second"):
-            self.role_select = discord.ui.Select(
-                placeholder=f"Выбрать направление · {settings['menu']}",
-                min_values=1,
-                max_values=1,
-                custom_id=f"ticket:role:{kind}",
-                options=[
-                    discord.SelectOption(label=ticket_role_label(role), value=role)
-                    for role in TICKET_ROLES
-                ],
-            )
-            self.role_select.callback = self.select_role
-            self.add_item(self.role_select)
+            roles = active_ticket_roles(guild_id, kind)
+            if roles:
+                self.role_select = discord.ui.Select(
+                    placeholder=f"Выбрать направление · {settings['menu']}",
+                    min_values=1,
+                    max_values=1,
+                    custom_id=f"ticket:role:{kind}",
+                    options=[discord.SelectOption(label=ticket_role_label(role), value=role)
+                             for role in roles],
+                )
+                self.role_select.callback = self.select_role
+                self.add_item(self.role_select)
+            else:
+                self.add_item(discord.ui.Button(label="Набор временно закрыт",
+                                                style=discord.ButtonStyle.secondary,
+                                                custom_id=f"ticket:closed:{kind}", disabled=True))
         else:
             button = discord.ui.Button(label=settings["button"], style=settings["style"],
                                        emoji=settings["emoji"], custom_id=f"ticket:create:{kind}")
@@ -1393,6 +1454,68 @@ class TicketPanelView(discord.ui.View):
 
     async def select_role(self, interaction: discord.Interaction):
         await create_ticket(interaction, self.kind, self.role_select.values[0])
+
+
+def ticket_admin_embed(guild_id: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="⚙️ Управление набором CL Team",
+        description=("Нажми направление, чтобы открыть или закрыть его.\n"
+                     "🟢 открыто для заявок · 🔴 закрыто"),
+        colour=0x5865F2,
+    )
+    for kind, title in (("main", "Мейн состав"), ("second", "Второй состав")):
+        active = set(active_ticket_roles(guild_id, kind))
+        opened = ", ".join(ticket_role_label(r) for r in TICKET_ROLES if r in active) or "нет"
+        closed = ", ".join(ticket_role_label(r) for r in TICKET_ROLES if r not in active) or "нет"
+        embed.add_field(name=title, value=f"**Открыто:** {opened}\n**Закрыто:** {closed}", inline=False)
+    embed.set_footer(text="Изменения сразу применяются к опубликованным панелям")
+    return embed
+
+
+class TicketRolesAdminView(discord.ui.View):
+    def __init__(self, guild_id: int | None = None):
+        super().__init__(timeout=None)
+        for kind_index, kind in enumerate(("main", "second")):
+            active = set(active_ticket_roles(guild_id, kind))
+            prefix = "М" if kind == "main" else "2"
+            for role_index, role in enumerate(TICKET_ROLES):
+                button = discord.ui.Button(
+                    label=f"{prefix}: {ticket_role_label(role)}",
+                    style=(discord.ButtonStyle.success if role in active else discord.ButtonStyle.danger),
+                    custom_id=f"ticket:toggle:{kind}:{role}",
+                    row=kind_index * 2 + role_index // 4,
+                )
+
+                async def toggle(interaction: discord.Interaction, selected_kind=kind, selected_role=role):
+                    await self.toggle_role(interaction, selected_kind, selected_role)
+
+                button.callback = toggle
+                self.add_item(button)
+
+    async def toggle_role(self, interaction: discord.Interaction, kind: str, role: str):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Только для лидеров и админов.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Настройки доступны только на сервере.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        key = ticket_roles_key(interaction.guild.id, kind)
+        active = set(active_ticket_roles(interaction.guild.id, kind))
+        if role in active:
+            active.remove(role)
+            state = "закрыто"
+        else:
+            active.add(role)
+            state = "открыто"
+        store.ticket_roles[key] = [r for r in TICKET_ROLES if r in active]
+        store.save()
+        updated = await refresh_ticket_panel(interaction.client, interaction.guild, kind)
+        await interaction.message.edit(embed=ticket_admin_embed(interaction.guild.id),
+                                       view=TicketRolesAdminView(interaction.guild.id))
+        panel_note = "Публичная панель обновлена." if updated else "Опубликованная панель не найдена."
+        await interaction.followup.send(
+            f"{ticket_role_label(role)}: **{state}**. {panel_note}", ephemeral=True)
 
 
 # ---------- бот ----------
@@ -1412,6 +1535,7 @@ class Bot(discord.Client):
         self.add_view(AdminView())
         for kind in TICKET_TYPES:
             self.add_view(TicketPanelView(kind))
+        self.add_view(TicketRolesAdminView())
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -1585,19 +1709,16 @@ async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None
     if not await admin_only(interaction):
         return
     await interaction.response.defer(ephemeral=True)
-    settings = TICKET_TYPES[kind]
-    embed = discord.Embed(
-        title=f"{settings['emoji']} {settings['panel_title']}",
-        description=settings["description"],
-        colour=settings["color"],
-    )
-    embed.set_author(name="CL TEAM • ПОДАТЬ ЗАЯВКУ" if kind != "support" else "CL TEAM • ПОДДЕРЖКА")
-    embed.set_footer(text="CL Team")
     try:
-        await interaction.channel.send(
-            embed=embed,
-            view=TicketPanelView(kind),
+        message = await interaction.channel.send(
+            embed=ticket_panel_embed(kind, interaction.guild.id),
+            view=TicketPanelView(kind, interaction.guild.id),
         )
+        store.ticket_panels[ticket_roles_key(interaction.guild.id, kind)] = {
+            "channel_id": message.channel.id,
+            "message_id": message.id,
+        }
+        store.save()
     except discord.Forbidden:
         await interaction.followup.send(
             "Не могу отправить панель в этот канал. Проверь права бота.", ephemeral=True)
@@ -1626,6 +1747,25 @@ async def second_panel(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 async def support_panel(interaction: discord.Interaction):
     await send_ticket_panel(interaction, "support")
+
+
+@bot.tree.command(name="ticket_admin_panel", description="Управление открытыми направлениями набора")
+@app_commands.default_permissions(manage_guild=True)
+async def ticket_admin_panel(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    target = interaction.guild.get_channel(cfg_id("admin")) or interaction.channel
+    try:
+        message = await target.send(embed=ticket_admin_embed(interaction.guild.id),
+                                    view=TicketRolesAdminView(interaction.guild.id))
+    except discord.Forbidden:
+        await interaction.followup.send("Не могу отправить админ-панель в закрытый канал.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"Не получилось выложить админ-панель: {short_error(e)}", ephemeral=True)
+        return
+    await interaction.followup.send(f"Админ-панель выложена: {message.jump_url}", ephemeral=True)
 
 
 async def send_who_plays(interaction: discord.Interaction):
