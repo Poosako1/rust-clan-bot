@@ -1280,13 +1280,21 @@ TICKET_TYPES = {
     },
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
+TICKET_ROLES = ["коллер", "комбат", "фермер", "электрик", "крафтер", "пилот", "fpv-пилот", "билдер"]
 TICKET_ROLE_EMOJIS = {
     "коллер": "📣",
     "комбат": "🔫",
-    "билдер": "🏗️",
     "фермер": "⛏️",
     "электрик": "⚡",
+    "крафтер": "🧰",
+    "пилот": "🚁",
+    "fpv-пилот": "🛸",
+    "билдер": "🏗️",
 }
+
+
+def ticket_role_label(role: str) -> str:
+    return "FPV-пилот" if role == "fpv-пилот" else role.capitalize()
 
 
 def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
@@ -1351,7 +1359,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
         if selected_role:
             role_emoji = TICKET_ROLE_EMOJIS.get(selected_role, "🎮")
-            embed.add_field(name="Направление", value=f"{role_emoji} {selected_role.capitalize()}", inline=True)
+            embed.add_field(name="Направление", value=f"{role_emoji} {ticket_role_label(selected_role)}", inline=True)
         embed.add_field(name="Статус", value="🟢 Ожидает ответа", inline=True)
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
@@ -1379,9 +1387,9 @@ class TicketPanelView(discord.ui.View):
                 max_values=1,
                 custom_id=f"ticket:role:{kind}",
                 options=[
-                    discord.SelectOption(label=role.capitalize(), value=role,
+                    discord.SelectOption(label=ticket_role_label(role), value=role,
                                          emoji=TICKET_ROLE_EMOJIS[role])
-                    for role in ROLES
+                    for role in TICKET_ROLES
                 ],
             )
             self.role_select.callback = self.select_role
