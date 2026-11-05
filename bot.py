@@ -1370,6 +1370,13 @@ def next_ticket_number(guild: discord.Guild, kind: str, selected_role: str | Non
     return number, channel_prefix
 
 
+def find_open_ticket(guild: discord.Guild, owner_id: int) -> discord.TextChannel | None:
+    """Найти любой ещё открытый тикет участника на сервере."""
+    owner_pattern = re.compile(rf"^ticket:(?:main|second|support) owner:{owner_id}(?: |$)")
+    return next((channel for channel in guild.text_channels
+                 if owner_pattern.match(channel.topic or "")), None)
+
+
 async def create_ticket(interaction: discord.Interaction, kind: str, selected_role: str | None = None) -> None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Тикеты можно создавать только на сервере.", ephemeral=True)
@@ -1377,10 +1384,18 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     settings = TICKET_TYPES[kind]
-    lock_key = f"{guild.id}:{kind}"
+    lock_key = f"{guild.id}:create"
     lock = _ticket_locks.setdefault(lock_key, asyncio.Lock())
     try:
         async with lock:
+            existing_ticket = find_open_ticket(guild, interaction.user.id)
+            if existing_ticket is not None:
+                await interaction.followup.send(
+                    f"У тебя уже есть открытый тикет: {existing_ticket.mention}. "
+                    "Сначала дождись его закрытия.",
+                    ephemeral=True,
+                )
+                return
             number, channel_prefix = next_ticket_number(guild, kind, selected_role)
             name = f"{channel_prefix}-{number}"
             channel = await guild.create_text_channel(
