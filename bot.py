@@ -1228,26 +1228,38 @@ class WipeView(discord.ui.View):
 TICKET_TYPES = {
     "main": {
         "prefix": "main",
-        "button": "Подать анкету в Main",
-        "title": "Анкета в Main состав",
-        "description": "Нажми кнопку, чтобы открыть приватный тикет для подачи анкеты в основной состав.",
-        "welcome": "Отправь здесь свою анкету в Main состав. Стафф ответит в этом канале.",
+        "button": "Открыть анкету в Main",
+        "emoji": "👑",
+        "color": 0xF1C40F,
+        "title": "Набор в Main состав",
+        "description": ("Хочешь попасть в основной состав? Создай личный тикет и расскажи о себе.\n\n"
+                        "Заявку увидит только администрация сервера."),
+        "welcome": ("Добро пожаловать! Отправь свою анкету одним сообщением и дождись ответа администрации. "
+                    "Можешь приложить скриншоты или другие материалы."),
         "style": discord.ButtonStyle.primary,
     },
     "second": {
         "prefix": "second",
-        "button": "Подать анкету во второй состав",
-        "title": "Анкета во второй состав",
-        "description": "Нажми кнопку, чтобы открыть приватный тикет для подачи анкеты во второй состав.",
-        "welcome": "Отправь здесь свою анкету во второй состав. Стафф ответит в этом канале.",
+        "button": "Открыть анкету во второй состав",
+        "emoji": "⚔️",
+        "color": 0x5865F2,
+        "title": "Набор во второй состав",
+        "description": ("Хочешь присоединиться ко второму составу? Создай личный тикет и расскажи о себе.\n\n"
+                        "Заявку увидит только администрация сервера."),
+        "welcome": ("Добро пожаловать! Отправь свою анкету одним сообщением и дождись ответа администрации. "
+                    "Можешь приложить скриншоты или другие материалы."),
         "style": discord.ButtonStyle.success,
     },
     "support": {
         "prefix": "support",
-        "button": "Обратиться в поддержку",
-        "title": "Поддержка",
-        "description": "Нажми кнопку, чтобы создать приватный канал с поддержкой.",
-        "welcome": "Опиши здесь свой вопрос или проблему. Стафф ответит в этом канале.",
+        "button": "Связаться с поддержкой",
+        "emoji": "🛟",
+        "color": 0x57F287,
+        "title": "Поддержка сервера",
+        "description": ("Возник вопрос или нужна помощь? Создай личный тикет и подробно опиши ситуацию.\n\n"
+                        "Обращение увидит только администрация сервера."),
+        "welcome": ("Опиши вопрос или проблему как можно подробнее. Если нужно, приложи скриншоты. "
+                    "Администрация ответит здесь, как только освободится."),
         "style": discord.ButtonStyle.secondary,
     },
 }
@@ -1308,8 +1320,17 @@ async def create_ticket(interaction: discord.Interaction, kind: str) -> None:
             store.save()
         staff = guild.get_role(staff_role_id())
         staff_mention = f" {staff.mention}" if staff is not None else ""
+        embed = discord.Embed(
+            title=f"{settings['emoji']} {settings['title']} — #{number}",
+            description=settings["welcome"],
+            colour=settings["color"],
+        )
+        embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Статус", value="🟢 Ожидает ответа", inline=True)
+        embed.set_footer(text="Этот канал доступен только вам и администрации")
         await channel.send(
-            f"{interaction.user.mention}{staff_mention}\n**{settings['title']}**\n{settings['welcome']}",
+            f"{interaction.user.mention}{staff_mention}",
+            embed=embed,
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
         await interaction.followup.send(f"Тикет создан: {channel.mention}", ephemeral=True)
@@ -1327,7 +1348,7 @@ class TicketPanelView(discord.ui.View):
         self.kind = kind
         settings = TICKET_TYPES[kind]
         button = discord.ui.Button(label=settings["button"], style=settings["style"],
-                                   custom_id=f"ticket:create:{kind}")
+                                   emoji=settings["emoji"], custom_id=f"ticket:create:{kind}")
         button.callback = self.open_ticket
         self.add_item(button)
 
@@ -1526,9 +1547,20 @@ async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None
         return
     await interaction.response.defer(ephemeral=True)
     settings = TICKET_TYPES[kind]
+    embed = discord.Embed(
+        title=f"{settings['emoji']} {settings['title']}",
+        description=settings["description"],
+        colour=settings["color"],
+    )
+    embed.add_field(
+        name="Как это работает?",
+        value="Нажми кнопку ниже — бот создаст отдельный приватный канал для общения с администрацией.",
+        inline=False,
+    )
+    embed.set_footer(text="Один клик — и тикет готов")
     try:
         await interaction.channel.send(
-            f"**{settings['title']}**\n{settings['description']}",
+            embed=embed,
             view=TicketPanelView(kind),
         )
     except discord.Forbidden:
