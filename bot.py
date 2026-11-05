@@ -1527,6 +1527,7 @@ class Bot(discord.Client):
         intents.members = MEMBERS_OK  # список участников: кто с ролью клана не заполнил анкету
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.guild_commands_synced = False
 
     async def setup_hook(self):
         self.add_view(PanelView())
@@ -1541,6 +1542,16 @@ class Bot(discord.Client):
         self.wipe_tick.start()
 
     async def on_ready(self):
+        if not self.guild_commands_synced:
+            sync_ok = True
+            for guild in self.guilds:
+                try:
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                except Exception as e:
+                    sync_ok = False
+                    print(f"Не удалось синхронизировать команды на сервере {guild.id}: {short_error(e)}", flush=True)
+            self.guild_commands_synced = sync_ok
         in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
         store.reconcile(in_voice)
         try:
@@ -1749,9 +1760,7 @@ async def support_panel(interaction: discord.Interaction):
     await send_ticket_panel(interaction, "support")
 
 
-@bot.tree.command(name="ticket_admin_panel", description="Управление открытыми направлениями набора")
-@app_commands.default_permissions(manage_guild=True)
-async def ticket_admin_panel(interaction: discord.Interaction):
+async def publish_ticket_admin_panel(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
     await interaction.response.defer(ephemeral=True)
@@ -1766,6 +1775,18 @@ async def ticket_admin_panel(interaction: discord.Interaction):
         await interaction.followup.send(f"Не получилось выложить админ-панель: {short_error(e)}", ephemeral=True)
         return
     await interaction.followup.send(f"Админ-панель выложена: {message.jump_url}", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_admin", description="Управление открытыми направлениями набора")
+@app_commands.default_permissions(manage_guild=True)
+async def ticket_admin(interaction: discord.Interaction):
+    await publish_ticket_admin_panel(interaction)
+
+
+@bot.tree.command(name="ticket_admin_panel", description="Управление открытыми направлениями набора")
+@app_commands.default_permissions(manage_guild=True)
+async def ticket_admin_panel(interaction: discord.Interaction):
+    await publish_ticket_admin_panel(interaction)
 
 
 async def send_who_plays(interaction: discord.Interaction):
