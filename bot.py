@@ -1285,7 +1285,7 @@ TICKET_ROLE_SLUGS = {
     "фермер": "farmer",
     "билдер": "builder",
 }
-TICKET_MAIN_REQUIREMENTS = {
+TICKET_SECOND_REQUIREMENTS = {
     "коллер": ("8к", 16),
     "комбат": ("3к", 15),
     "fpv-пилот": ("2.5к", 15),
@@ -1303,8 +1303,11 @@ def ticket_role_label(role: str) -> str:
 def ticket_role_option(role: str, kind: str) -> discord.SelectOption:
     description = None
     if kind == "main":
-        hours, age = TICKET_MAIN_REQUIREMENTS[role]
-        description = f"От {hours} часов · от {age} лет · only x3d"
+        hours = "8к" if role == "коллер" else "4к"
+        description = f"От {hours} часов · only x3d"
+    elif kind == "second":
+        hours, age = TICKET_SECOND_REQUIREMENTS[role]
+        description = f"От {hours} часов · от {age} лет"
     return discord.SelectOption(label=ticket_role_label(role), value=role, description=description)
 
 
