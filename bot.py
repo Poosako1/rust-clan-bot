@@ -1320,6 +1320,18 @@ TICKET_CLOSE_REASONS = {
     "accepted": "Принят",
 }
 TICKET_ROLE_CONFIG_KEYS = {slug: f"ticket_role_{slug}" for slug in TICKET_ROLE_SLUGS.values()}
+TICKET_ROLE_LABELS = {
+    "coller": "Коллер",
+    "combat": "Комбат",
+    "fpv": "FPV-пилот",
+    "pilot": "Пилот",
+    "crafter": "Крафтер",
+    "electric": "Электрик",
+    "farmer": "Фермер",
+    "builder": "Билдер",
+}
+TICKET_SYNC_TEAM_LABELS = {"main": "Мейн", "second": "Второй состав"}
+_ticket_role_sync_lock = asyncio.Lock()
 
 
 def ticket_role_label(role: str) -> str:
@@ -1683,6 +1695,246 @@ class TicketCloseView(discord.ui.View):
                                                 view=TicketCloseConfirmView(interaction.user.id), ephemeral=True)
 
 
+def ticket_sync_source_guild_key(team: str) -> str:
+    return f"ticket_sync_source_{team}_guild"
+
+
+def ticket_sync_source_role_key(team: str, role_slug: str) -> str:
+    return f"ticket_sync_source_{team}_{role_slug}"
+
+
+async def fetch_all_members(guild: discord.Guild) -> dict[int, discord.Member]:
+    members = {}
+    async for member in guild.fetch_members(limit=None):
+        if not member.bot:
+            members[member.id] = member
+    return members
+
+
+def sync_member_name(member: discord.Member) -> str:
+    return f"{member} ({member.id})"
+
+
+async def synchronize_ticket_roles(client: discord.Client, target_guild: discord.Guild) -> tuple[str, str]:
+    """Синхронизировать составы и направления из двух приваток в Community."""
+    if not MEMBERS_OK:
+        raise RuntimeError("В Discord Developer Portal не включён Server Members Intent.")
+    if cfg_id("ticket_sync_target_guild") != target_guild.id:
+        raise RuntimeError("Эта панель находится не на настроенном Community-сервере.")
+
+    source_guilds = {}
+    for team in ("main", "second"):
+        guild_id = cfg_id(ticket_sync_source_guild_key(team))
+        source_guild = client.get_guild(guild_id) if guild_id else None
+        if source_guild is None:
+            raise RuntimeError(
+                f"Не настроена приватка «{TICKET_SYNC_TEAM_LABELS[team]}». "
+                f"Запусти в ней `/ticket_roles team:{TICKET_SYNC_TEAM_LABELS[team]}`."
+            )
+        source_guilds[team] = source_guild
+
+    group_roles = {
+        "main": target_guild.get_role(cfg_id("ticket_group_main")),
+        "second": target_guild.get_role(cfg_id("ticket_group_second")),
+    }
+    missing_groups = [TICKET_SYNC_TEAM_LABELS[team] for team, role in group_roles.items() if role is None]
+    if missing_groups:
+        raise RuntimeError("Не настроены роли составов в Community: " + ", ".join(missing_groups) + ".")
+
+    target_direction_roles = {}
+    deleted_target_roles = []
+    for role_slug, config_key in TICKET_ROLE_CONFIG_KEYS.items():
+        role_id = cfg_id(config_key)
+        role = target_guild.get_role(role_id) if role_id else None
+        if role_id and role is None:
+            deleted_target_roles.append(TICKET_ROLE_LABELS[role_slug])
+        elif role is not None:
+            target_direction_roles[role_slug] = role
+    if deleted_target_roles:
+        raise RuntimeError("В Community не найдены настроенные роли: " + ", ".join(deleted_target_roles) + ".")
+
+    source_direction_roles: dict[str, dict[str, discord.Role]] = {"main": {}, "second": {}}
+    missing_mappings = []
+    for team, source_guild in source_guilds.items():
+        for role_slug in target_direction_roles:
+            source_role_id = cfg_id(ticket_sync_source_role_key(team, role_slug))
+            source_role = source_guild.get_role(source_role_id) if source_role_id else None
+            if source_role is None:
+                missing_mappings.append(
+                    f"{TICKET_SYNC_TEAM_LABELS[team]} — {TICKET_ROLE_LABELS[role_slug]}"
+                )
+            else:
+                source_direction_roles[team][role_slug] = source_role
+    if missing_mappings:
+        raise RuntimeError("Не сопоставлены роли в приватках: " + ", ".join(missing_mappings) + ".")
+
+    managed_roles = {*group_roles.values(), *target_direction_roles.values()}
+    me = target_guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        raise RuntimeError("У бота в Community нет права «Управлять ролями».")
+    unavailable = [role.name for role in managed_roles if role.managed or role >= me.top_role]
+    if unavailable:
+        raise RuntimeError("Бот не может управлять ролями выше своей роли: " + ", ".join(unavailable) + ".")
+
+    try:
+        main_members, second_members, target_members = await asyncio.gather(
+            fetch_all_members(source_guilds["main"]),
+            fetch_all_members(source_guilds["second"]),
+            fetch_all_members(target_guild),
+        )
+    except discord.Forbidden as e:
+        raise RuntimeError("Бот не может получить список участников одного из серверов.") from e
+    if not main_members or not second_members or not target_members:
+        raise RuntimeError(
+            "Один из серверов вернул пустой список участников. Синхронизация остановлена, чтобы не снять роли ошибочно."
+        )
+
+    main_ids = set(main_members)
+    second_ids = set(second_members)
+    both_ids = main_ids & second_ids
+    second_only_ids = second_ids - main_ids
+    source_ids = main_ids | second_ids
+    missing_in_community = sorted(source_ids - set(target_members))
+    managed_role_ids = {role.id for role in managed_roles}
+    role_by_id = {role.id: role for role in managed_roles}
+
+    changed_lines = []
+    error_lines = []
+    added_total = 0
+    removed_total = 0
+    unchanged = 0
+    for member in target_members.values():
+        desired_ids = set()
+        source_member = None
+        source_team = None
+        if member.id in main_ids:
+            source_team = "main"
+            source_member = main_members[member.id]
+            desired_ids.add(group_roles["main"].id)
+        elif member.id in second_only_ids:
+            source_team = "second"
+            source_member = second_members[member.id]
+            desired_ids.add(group_roles["second"].id)
+        if source_member is not None and source_team is not None:
+            source_role_ids = {role.id for role in source_member.roles}
+            for role_slug, target_role in target_direction_roles.items():
+                if source_direction_roles[source_team][role_slug].id in source_role_ids:
+                    desired_ids.add(target_role.id)
+
+        current_ids = {role.id for role in member.roles}
+        add_ids = desired_ids - current_ids
+        remove_ids = (current_ids & managed_role_ids) - desired_ids
+        if not add_ids and not remove_ids:
+            unchanged += 1
+            continue
+        add_roles = [role_by_id[role_id] for role_id in sorted(add_ids)]
+        remove_roles = [role_by_id[role_id] for role_id in sorted(remove_ids)]
+        if add_roles:
+            try:
+                await member.add_roles(*add_roles, reason="Синхронизация ролей CL Team")
+            except Exception as e:
+                error_lines.append(f"• {sync_member_name(member)} — роли не выданы: {short_error(e)}")
+                continue
+            added_total += len(add_roles)
+        if remove_roles:
+            try:
+                await member.remove_roles(*remove_roles, reason="Синхронизация ролей CL Team")
+            except Exception as e:
+                error_lines.append(f"• {sync_member_name(member)} — роли не сняты: {short_error(e)}")
+                remove_roles = []
+            else:
+                removed_total += len(remove_roles)
+        changes = []
+        if add_roles:
+            changes.append("выданы: " + ", ".join(role.name for role in add_roles))
+        if remove_roles:
+            changes.append("сняты: " + ", ".join(role.name for role in remove_roles))
+        if changes:
+            changed_lines.append(f"• {sync_member_name(member)} — {'; '.join(changes)}")
+
+    missing_lines = []
+    for member_id in missing_in_community:
+        source_member = main_members.get(member_id) or second_members.get(member_id)
+        missing_lines.append(f"• {sync_member_name(source_member)}")
+
+    now = dt.datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    report_lines = [
+        f"Синхронизация ролей CL Team — {now}",
+        f"Community: {target_guild.name}",
+        f"Мейн-приватка: {source_guilds['main'].name} — {len(main_ids)} участников",
+        f"Вторая приватка: {source_guilds['second'].name} — {len(second_ids)} участников",
+        f"В обеих приватках (приоритет Мейн): {len(both_ids)}",
+        f"Выдано ролей: {added_total}",
+        f"Снято ролей: {removed_total}",
+        f"Без изменений: {unchanged}",
+        "",
+        "Изменения:",
+        *(changed_lines or ["• Нет"]),
+        "",
+        "Есть в приватке, но отсутствуют в Community:",
+        *(missing_lines or ["• Нет"]),
+        "",
+        "Ошибки:",
+        *(error_lines or ["• Нет"]),
+    ]
+    summary = (f"Выдано ролей: {added_total}, снято: {removed_total}, "
+               f"ошибок: {len(error_lines)}, нет в Community: {len(missing_lines)}.")
+    return "\n".join(report_lines), summary
+
+
+async def send_ticket_sync_report(client: discord.Client, owner_id: int, report: str) -> None:
+    owner = client.get_user(owner_id)
+    if owner is None:
+        owner = await client.fetch_user(owner_id)
+    if len(report) <= 1900:
+        await owner.send(report, allowed_mentions=NO_PINGS)
+        return
+    stamp = dt.datetime.now(TZ).strftime("%Y%m%d-%H%M")
+    await owner.send(
+        "Синхронизация завершена. Полный отчёт прикреплён файлом.",
+        file=discord.File(io.BytesIO(report.encode("utf-8")), filename=f"role-sync-{stamp}.txt"),
+    )
+
+
+class TicketRoleSyncView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Синхронизировать составы", style=discord.ButtonStyle.primary,
+                       custom_id="ticket:roles:sync")
+    async def sync_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        owner_id = cfg_id("ticket_sync_report_owner")
+        if not owner_id or interaction.user.id != owner_id:
+            await interaction.response.send_message("Эта кнопка доступна только владельцу панели.", ephemeral=True)
+            return
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not perms or not perms.administrator:
+            await interaction.response.send_message("Нужно право «Администратор».", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Синхронизация работает только на сервере.", ephemeral=True)
+            return
+        if _ticket_role_sync_lock.locked():
+            await interaction.response.send_message("Синхронизация уже выполняется.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with _ticket_role_sync_lock:
+                report, summary = await synchronize_ticket_roles(interaction.client, interaction.guild)
+        except Exception as e:
+            detail = str(e) if isinstance(e, RuntimeError) else short_error(e)
+            await interaction.edit_original_response(content=f"Синхронизация не выполнена: {detail}"[:1900])
+            return
+        try:
+            await send_ticket_sync_report(interaction.client, owner_id, report)
+        except Exception as e:
+            await interaction.edit_original_response(
+                content=f"Роли синхронизированы, но не получилось отправить отчёт в личку: {short_error(e)}. {summary}"
+            )
+            return
+        await interaction.edit_original_response(content=f"Готово. Отчёт отправлен тебе в личку. {summary}")
+
+
 # ---------- бот ----------
 class Bot(discord.Client):
     def __init__(self):
@@ -1700,6 +1952,7 @@ class Bot(discord.Client):
         self.add_view(AdminView())
         self.add_view(TicketCloseView())
         self.add_view(TicketApplicationCloseView())
+        self.add_view(TicketRoleSyncView())
         for kind in TICKET_TYPES:
             self.add_view(TicketPanelView(kind))
         await self.tree.sync()
@@ -1723,6 +1976,14 @@ class Bot(discord.Client):
         except Exception as e:
             print(f"Не удалось прочитать вайпы из таблицы: {e}", flush=True)
         print(f"Бот запущен как {self.user}", flush=True)
+
+    async def on_guild_join(self, guild: discord.Guild):
+        """Сразу добавить slash-команды, когда бота пригласили в новую приватку."""
+        try:
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        except Exception as e:
+            print(f"Не удалось синхронизировать команды на новом сервере {guild.id}: {short_error(e)}", flush=True)
 
     async def on_invite_delete(self, invite):
         """Логировать удаление инвайта в закрытый канал; исполнитель берётся из Audit Log."""
@@ -1940,16 +2201,22 @@ async def ticket_logs_setup(interaction: discord.Interaction):
         f"Готово: {channels[0].mention} и {channels[1].mention}.", ephemeral=True)
 
 
-@bot.tree.command(name="ticket_roles", description="Настроить роли, выдаваемые при принятии анкеты")
+@bot.tree.command(name="ticket_roles", description="Настроить роли анкет или сопоставление ролей приватки")
 @app_commands.describe(
+    team="В приватке выбери, к какому составу она относится",
     coller="Роль коллера", combat="Роль комбата", fpv="Роль FPV-пилота",
     pilot="Роль пилота", crafter="Роль крафтера", electric="Роль электрика",
     farmer="Роль фермера", builder="Роль билдера",
     main_group="Дополнительная роль Мейн состава",
     second_group="Дополнительная роль второго состава",
 )
+@app_commands.choices(team=[
+    app_commands.Choice(name="Мейн", value="main"),
+    app_commands.Choice(name="Второй состав", value="second"),
+])
 @app_commands.default_permissions(manage_guild=True)
-async def ticket_roles(interaction: discord.Interaction, coller: discord.Role | None = None,
+async def ticket_roles(interaction: discord.Interaction, team: str | None = None,
+                       coller: discord.Role | None = None,
                        combat: discord.Role | None = None, fpv: discord.Role | None = None,
                        pilot: discord.Role | None = None, crafter: discord.Role | None = None,
                        electric: discord.Role | None = None, farmer: discord.Role | None = None,
@@ -1957,42 +2224,84 @@ async def ticket_roles(interaction: discord.Interaction, coller: discord.Role | 
                        second_group: discord.Role | None = None):
     if not await admin_only(interaction):
         return
-    supplied = {
-        "ticket_role_coller": coller,
-        "ticket_role_combat": combat,
-        "ticket_role_fpv": fpv,
-        "ticket_role_pilot": pilot,
-        "ticket_role_crafter": crafter,
-        "ticket_role_electric": electric,
-        "ticket_role_farmer": farmer,
-        "ticket_role_builder": builder,
-        "ticket_group_main": main_group,
-        "ticket_group_second": second_group,
+    direction_supplied = {
+        "coller": coller,
+        "combat": combat,
+        "fpv": fpv,
+        "pilot": pilot,
+        "crafter": crafter,
+        "electric": electric,
+        "farmer": farmer,
+        "builder": builder,
     }
-    changed = [role for role in supplied.values() if role is not None]
-    for key, role in supplied.items():
-        if role is not None:
-            store.cfg[key] = role.id
-    if changed:
-        store.save()
 
-    labels = {
-        "ticket_role_coller": "Коллер", "ticket_role_combat": "Комбат",
-        "ticket_role_fpv": "FPV-пилот", "ticket_role_pilot": "Пилот",
-        "ticket_role_crafter": "Крафтер", "ticket_role_electric": "Электрик",
-        "ticket_role_farmer": "Фермер", "ticket_role_builder": "Билдер",
-        "ticket_group_main": "Доп. роль Мейн", "ticket_group_second": "Доп. роль второго состава",
-    }
-    lines = ["**Роли для принятых анкет:**"]
-    for key, label in labels.items():
-        role = interaction.guild.get_role(cfg_id(key))
-        if role is not None:
-            lines.append(f"• {label}: {role.mention}")
-    if len(lines) == 1:
-        lines.append("Настроенных ролей пока нет.")
-    if changed:
-        lines.insert(0, "Настройки сохранены.\n")
+    if team in TICKET_SYNC_TEAM_LABELS:
+        store.cfg[ticket_sync_source_guild_key(team)] = interaction.guild.id
+        changed = []
+        for role_slug, role in direction_supplied.items():
+            if role is not None:
+                store.cfg[ticket_sync_source_role_key(team, role_slug)] = role.id
+                changed.append(role)
+        store.save()
+        lines = [f"**Роли приватки · {TICKET_SYNC_TEAM_LABELS[team]}:**"]
+        for role_slug, label in TICKET_ROLE_LABELS.items():
+            role = interaction.guild.get_role(cfg_id(ticket_sync_source_role_key(team, role_slug)))
+            if role is not None:
+                lines.append(f"• {label}: {role.mention}")
+        if len(lines) == 1:
+            lines.append("Настроенных ролей пока нет.")
+        if main_group is not None or second_group is not None:
+            lines.append("Роли составов указываются через `/ticket_roles` только в Community.")
+        lines.insert(0, "Приватка сохранена.\n" if changed else "Приватка выбрана.\n")
+    else:
+        supplied = {
+            **{TICKET_ROLE_CONFIG_KEYS[role_slug]: role for role_slug, role in direction_supplied.items()},
+            "ticket_group_main": main_group,
+            "ticket_group_second": second_group,
+        }
+        changed = [role for role in supplied.values() if role is not None]
+        for key, role in supplied.items():
+            if role is not None:
+                store.cfg[key] = role.id
+        if changed:
+            store.save()
+        labels = {
+            **{TICKET_ROLE_CONFIG_KEYS[role_slug]: label for role_slug, label in TICKET_ROLE_LABELS.items()},
+            "ticket_group_main": "Доп. роль Мейн",
+            "ticket_group_second": "Доп. роль второго состава",
+        }
+        lines = ["**Роли для принятых анкет:**"]
+        for key, label in labels.items():
+            role = interaction.guild.get_role(cfg_id(key))
+            if role is not None:
+                lines.append(f"• {label}: {role.mention}")
+        if len(lines) == 1:
+            lines.append("Настроенных ролей пока нет.")
+        if changed:
+            lines.insert(0, "Настройки сохранены.\n")
     await interaction.response.send_message("\n".join(lines), ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="ticket_sync_panel", description="Выложить панель синхронизации ролей составов")
+@app_commands.default_permissions(administrator=True)
+async def ticket_sync_panel(interaction: discord.Interaction):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if interaction.guild is None or not perms or not perms.administrator:
+        await interaction.response.send_message("Нужно право «Администратор».", ephemeral=True)
+        return
+    store.cfg["ticket_sync_target_guild"] = interaction.guild.id
+    store.cfg["ticket_sync_report_owner"] = interaction.user.id
+    store.save()
+    embed = discord.Embed(
+        title="Синхронизация составов",
+        description=("Выдаёт и снимает настроенные роли Community по участникам двух приваток. "
+                     "Если участник находится в обеих приватках, приоритет получает Мейн."),
+        colour=0x5865F2,
+    )
+    embed.set_footer(text="Отчёт придёт владельцу панели в личные сообщения")
+    await interaction.channel.send(embed=embed, view=TicketRoleSyncView())
+    await interaction.response.send_message(
+        "Панель выложена. Отчёты будут приходить тебе в личку.", ephemeral=True)
 
 
 async def send_who_plays(interaction: discord.Interaction):
