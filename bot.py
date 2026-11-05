@@ -1251,8 +1251,9 @@ APPLICATION_FORM = (
     "2 - Возраст\n"
     "3 - Ссылка на Стим\n"
     "4 - Часов в игре\n"
-    "5 - В каких последних кланах играли и почему вышли?\n"
-    "6 - Что ищете в нашем клане?"
+    "5 - Ваши комплектующие ПК?\n"
+    "6 - В каких последних кланах играли и почему вышли?\n"
+    "7 - Что ищете в нашем клане?"
 )
 
 
@@ -1472,10 +1473,10 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         if selected_role:
             embed.add_field(name="Направление", value=ticket_role_label(selected_role), inline=True)
         await channel.send(
-            f"{interaction.user.mention}{staff_mention}",
+            f"@everyone {interaction.user.mention}{staff_mention}",
             embed=embed,
             view=(TicketApplicationCloseView() if kind in ("main", "second") else TicketCloseView()),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True),
         )
         await interaction.followup.send(f"Тикет создан: {channel.mention}", ephemeral=True)
     except discord.Forbidden:
