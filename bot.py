@@ -1553,7 +1553,6 @@ async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None
         description=settings["description"],
         colour=settings["color"],
     )
-    embed.set_footer(text="Один клик — и тикет готов")
     try:
         await interaction.channel.send(
             embed=embed,
