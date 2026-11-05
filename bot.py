@@ -1399,6 +1399,7 @@ class Bot(discord.Client):
         intents.members = MEMBERS_OK  # список участников: кто с ролью клана не заполнил анкету
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.guild_commands_cleaned = False
 
     async def setup_hook(self):
         self.add_view(PanelView())
@@ -1411,6 +1412,16 @@ class Bot(discord.Client):
         self.wipe_tick.start()
 
     async def on_ready(self):
+        if not self.guild_commands_cleaned:
+            cleanup_ok = True
+            for guild in self.guilds:
+                try:
+                    self.tree.clear_commands(guild=guild)
+                    await self.tree.sync(guild=guild)
+                except Exception as e:
+                    cleanup_ok = False
+                    print(f"Не удалось очистить старые серверные команды {guild.id}: {short_error(e)}", flush=True)
+            self.guild_commands_cleaned = cleanup_ok
         in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
         store.reconcile(in_voice)
         try:
