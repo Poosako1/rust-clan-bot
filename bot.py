@@ -1281,16 +1281,6 @@ TICKET_TYPES = {
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
 TICKET_ROLES = ["коллер", "комбат", "фермер", "электрик", "крафтер", "пилот", "fpv-пилот", "билдер"]
-TICKET_ROLE_EMOJIS = {
-    "коллер": "📣",
-    "комбат": "🔫",
-    "фермер": "⛏️",
-    "электрик": "⚡",
-    "крафтер": "🧰",
-    "пилот": "🚁",
-    "fpv-пилот": "🛸",
-    "билдер": "🏗️",
-}
 
 
 def ticket_role_label(role: str) -> str:
@@ -1358,8 +1348,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         )
         embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
         if selected_role:
-            role_emoji = TICKET_ROLE_EMOJIS.get(selected_role, "🎮")
-            embed.add_field(name="Направление", value=f"{role_emoji} {ticket_role_label(selected_role)}", inline=True)
+            embed.add_field(name="Направление", value=ticket_role_label(selected_role), inline=True)
         embed.add_field(name="Статус", value="🟢 Ожидает ответа", inline=True)
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
@@ -1387,8 +1376,7 @@ class TicketPanelView(discord.ui.View):
                 max_values=1,
                 custom_id=f"ticket:role:{kind}",
                 options=[
-                    discord.SelectOption(label=ticket_role_label(role), value=role,
-                                         emoji=TICKET_ROLE_EMOJIS[role])
+                    discord.SelectOption(label=ticket_role_label(role), value=role)
                     for role in TICKET_ROLES
                 ],
             )
