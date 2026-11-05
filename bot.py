@@ -1276,6 +1276,16 @@ TICKET_TYPES = {
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
 TICKET_ROLES = ["коллер", "комбат", "фермер", "электрик", "крафтер", "пилот", "fpv-пилот", "билдер"]
+TICKET_ROLE_SLUGS = {
+    "коллер": "coller",
+    "комбат": "combat",
+    "фермер": "farmer",
+    "электрик": "electric",
+    "крафтер": "crafter",
+    "пилот": "pilot",
+    "fpv-пилот": "fpv",
+    "билдер": "builder",
+}
 
 
 def ticket_role_label(role: str) -> str:
@@ -1303,13 +1313,16 @@ def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
     return overwrites
 
 
-def next_ticket_number(guild: discord.Guild, kind: str) -> int:
+def next_ticket_number(guild: discord.Guild, kind: str, selected_role: str | None = None) -> tuple[int, str]:
     """Следующий номер с учётом сохранённого счётчика и уже существующих каналов."""
     prefix = TICKET_TYPES[kind]["prefix"]
-    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+    role_slug = TICKET_ROLE_SLUGS.get(selected_role or "")
+    channel_prefix = f"{prefix}-{role_slug}" if role_slug else prefix
+    pattern = re.compile(rf"^{re.escape(channel_prefix)}-(\d+)$")
     existing = [int(m.group(1)) for ch in guild.text_channels if (m := pattern.fullmatch(ch.name))]
-    key = f"{guild.id}:{kind}"
-    return max([int(store.ticket_counters.get(key, 0)), *existing], default=0) + 1
+    key = f"{guild.id}:{kind}:{role_slug or 'general'}"
+    number = max([int(store.ticket_counters.get(key, 0)), *existing], default=0) + 1
+    return number, channel_prefix
 
 
 async def create_ticket(interaction: discord.Interaction, kind: str, selected_role: str | None = None) -> None:
@@ -1323,8 +1336,8 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
     lock = _ticket_locks.setdefault(lock_key, asyncio.Lock())
     try:
         async with lock:
-            number = next_ticket_number(guild, kind)
-            name = f"{settings['prefix']}-{number}"
+            number, channel_prefix = next_ticket_number(guild, kind, selected_role)
+            name = f"{channel_prefix}-{number}"
             channel = await guild.create_text_channel(
                 name,
                 category=getattr(interaction.channel, "category", None),
@@ -1332,7 +1345,8 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
                 topic=f"ticket:{kind} owner:{interaction.user.id}",
                 reason=f"{settings['title']}: {interaction.user}",
             )
-            store.ticket_counters[lock_key] = number
+            counter_key = f"{guild.id}:{kind}:{TICKET_ROLE_SLUGS.get(selected_role or '') or 'general'}"
+            store.ticket_counters[counter_key] = number
             store.save()
         staff = guild.get_role(staff_role_id())
         staff_mention = f" {staff.mention}" if staff is not None else ""
