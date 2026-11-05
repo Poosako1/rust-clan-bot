@@ -1311,6 +1311,15 @@ TICKET_SECOND_REQUIREMENTS = {
     "фермер": ("2к", 15),
     "билдер": ("3к", 15),
 }
+TICKET_CLOSE_REASONS = {
+    "low_hours": "Мало часов",
+    "blacklist": "Блэклист",
+    "inappropriate": "Неадекватный",
+    "age": "Не проходит по возрасту",
+    "obsolete": "Тикет неактуален",
+    "accepted": "Принят",
+}
+TICKET_ROLE_CONFIG_KEYS = {slug: f"ticket_role_{slug}" for slug in TICKET_ROLE_SLUGS.values()}
 
 
 def ticket_role_label(role: str) -> str:
@@ -1378,7 +1387,8 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
                 name,
                 category=getattr(interaction.channel, "category", None),
                 overwrites=ticket_overwrites(guild, interaction.user),
-                topic=f"ticket:{kind} owner:{interaction.user.id}",
+                topic=(f"ticket:{kind} owner:{interaction.user.id} "
+                       f"role:{TICKET_ROLE_SLUGS.get(selected_role or '', 'general')}"),
                 reason=f"{settings['title']}: {interaction.user}",
             )
             counter_key = f"{guild.id}:{kind}:{TICKET_ROLE_SLUGS.get(selected_role or '') or 'general'}"
@@ -1397,7 +1407,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
             embed=embed,
-            view=TicketCloseView(),
+            view=(TicketApplicationCloseView() if kind in ("main", "second") else TicketCloseView()),
             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
         await interaction.followup.send(f"Тикет создан: {channel.mention}", ephemeral=True)
@@ -1484,12 +1494,12 @@ async def ensure_ticket_log_channels(guild: discord.Guild, category=None) -> lis
     return channels
 
 
-async def save_ticket_transcript(channel: discord.TextChannel) -> tuple[bool, str]:
+async def save_ticket_transcript(channel: discord.TextChannel, close_reason: str, closer) -> tuple[bool, str]:
     if not MESSAGE_CONTENT_OK:
         return False, ("В Discord Developer Portal включи Bot → Privileged Gateway Intents → "
                        "Message Content Intent и перезапусти бота.")
     topic = channel.topic or ""
-    match = re.search(r"^ticket:(main|second|support) owner:(\d+)", topic)
+    match = re.search(r"^ticket:(main|second|support) owner:(\d+)(?: role:([\w-]+))?", topic)
     if not match:
         return False, "Не удалось определить тип и автора тикета."
     kind = match.group(1)
@@ -1505,7 +1515,8 @@ async def save_ticket_transcript(channel: discord.TextChannel) -> tuple[bool, st
             return False, f"Не удалось создать каналы логов: {short_error(e)}"
 
     messages = [m async for m in channel.history(limit=None, oldest_first=True)]
-    lines = [f"Тикет: #{channel.name}", f"ID канала: {channel.id}", ""]
+    lines = [f"Тикет: #{channel.name}", f"ID канала: {channel.id}",
+             f"Причина закрытия: {close_reason}", f"Закрыл: {closer} ({closer.id})", ""]
     for message in messages:
         stamp = message.created_at.astimezone(TZ).strftime("%d.%m.%Y %H:%M:%S")
         author = f"{message.author} ({message.author.id})"
@@ -1533,10 +1544,48 @@ async def save_ticket_transcript(channel: discord.TextChannel) -> tuple[bool, st
     return True, f"Лог сохранён в {log_channel.mention}."
 
 
+async def grant_accepted_ticket_roles(channel: discord.TextChannel) -> tuple[bool, str]:
+    match = re.search(r"^ticket:(main|second) owner:(\d+) role:([\w-]+)", channel.topic or "")
+    if not match:
+        return False, "Не удалось определить состав, участника или направление тикета."
+    kind, owner_id, role_slug = match.group(1), int(match.group(2)), match.group(3)
+    member = channel.guild.get_member(owner_id)
+    if member is None:
+        try:
+            member = await channel.guild.fetch_member(owner_id)
+        except Exception:
+            return False, "Автор тикета больше не находится на сервере."
+
+    direction_key = TICKET_ROLE_CONFIG_KEYS.get(role_slug)
+    group_key = "ticket_group_main" if kind == "main" else "ticket_group_second"
+    direction_role = channel.guild.get_role(cfg_id(direction_key)) if direction_key else None
+    group_role = channel.guild.get_role(cfg_id(group_key))
+    missing = []
+    if direction_role is None:
+        missing.append("роль направления")
+    if group_role is None:
+        missing.append("дополнительная роль состава")
+    if missing:
+        return False, "Не настроена " + " и ".join(missing) + ". Используй `/ticket_roles`."
+
+    roles = list({direction_role.id: direction_role, group_role.id: group_role}.values())
+    try:
+        await member.add_roles(*roles, reason=f"Принят через тикет #{channel.name}")
+    except discord.Forbidden:
+        return False, "Бот не может выдать роли. Подними роль бота выше выдаваемых ролей."
+    except Exception as e:
+        return False, f"Не удалось выдать роли: {short_error(e)}"
+    return True, "Роли участнику выданы."
+
+
 class TicketCloseConfirmView(discord.ui.View):
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, reason: str = "Закрыт", accepted: bool = False,
+                 staff_only: bool = False):
         super().__init__(timeout=60)
         self.user_id = user_id
+        self.reason = reason
+        self.accepted = accepted
+        self.staff_only = staff_only
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.user_id:
@@ -1548,15 +1597,23 @@ class TicketCloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Закрыть", style=discord.ButtonStyle.danger, custom_id="ticket:close:confirm")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
-        if not can_close_ticket(interaction) or not isinstance(channel, discord.TextChannel):
+        allowed = is_staff_member(interaction.user) if self.staff_only else can_close_ticket(interaction)
+        if not allowed or not isinstance(channel, discord.TextChannel):
             await interaction.response.edit_message(content="У тебя нет права закрыть этот тикет.", view=None)
             return
         await interaction.response.defer(ephemeral=True)
-        saved, detail = await save_ticket_transcript(channel)
+        role_detail = ""
+        if self.accepted:
+            granted, role_detail = await grant_accepted_ticket_roles(channel)
+            if not granted:
+                await interaction.edit_original_response(content=f"Тикет не закрыт. {role_detail}", view=None)
+                return
+        saved, detail = await save_ticket_transcript(channel, self.reason, interaction.user)
         if not saved:
             await interaction.edit_original_response(content=f"Тикет не закрыт. {detail}", view=None)
             return
-        await interaction.edit_original_response(content=f"{detail} Тикет закрывается…", view=None)
+        prefix = f"{role_detail} " if role_detail else ""
+        await interaction.edit_original_response(content=f"{prefix}{detail} Тикет закрывается…", view=None)
         await asyncio.sleep(1)
         try:
             await channel.delete(reason=f"Тикет закрыт пользователем {interaction.user}")
@@ -1569,6 +1626,35 @@ class TicketCloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary, custom_id="ticket:close:cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Закрытие отменено.", view=None)
+
+
+class TicketApplicationCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.reason_select = discord.ui.Select(
+            placeholder="Выбрать причину закрытия тикета",
+            min_values=1,
+            max_values=1,
+            custom_id="ticket:application:close_reason",
+            options=[discord.SelectOption(label=label, value=value)
+                     for value, label in TICKET_CLOSE_REASONS.items()],
+        )
+        self.reason_select.callback = self.select_reason
+        self.add_item(self.reason_select)
+
+    async def select_reason(self, interaction: discord.Interaction):
+        if not is_staff_member(interaction.user):
+            await interaction.response.send_message("Причину закрытия выбирает только администрация.",
+                                                    ephemeral=True)
+            return
+        reason_key = self.reason_select.values[0]
+        reason = TICKET_CLOSE_REASONS[reason_key]
+        await interaction.response.send_message(
+            f"Закрыть тикет с причиной «{reason}»?",
+            view=TicketCloseConfirmView(interaction.user.id, reason=reason,
+                                        accepted=reason_key == "accepted", staff_only=True),
+            ephemeral=True,
+        )
 
 
 class TicketCloseView(discord.ui.View):
@@ -1601,6 +1687,7 @@ class Bot(discord.Client):
         self.add_view(StatusView())
         self.add_view(AdminView())
         self.add_view(TicketCloseView())
+        self.add_view(TicketApplicationCloseView())
         for kind in TICKET_TYPES:
             self.add_view(TicketPanelView(kind))
         await self.tree.sync()
@@ -1839,6 +1926,58 @@ async def ticket_logs_setup(interaction: discord.Interaction):
         return
     await interaction.followup.send(
         f"Готово: {channels[0].mention} и {channels[1].mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_roles", description="Настроить роли, выдаваемые при принятии анкеты")
+@app_commands.describe(
+    coller="Роль коллера", combat="Роль комбата", fpv="Роль FPV-пилота",
+    pilot="Роль пилота", crafter="Роль крафтера", electric="Роль электрика",
+    farmer="Роль фермера", builder="Роль билдера",
+    main_group="Дополнительная роль Мейн состава",
+    second_group="Дополнительная роль второго состава",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def ticket_roles(interaction: discord.Interaction, coller: discord.Role | None = None,
+                       combat: discord.Role | None = None, fpv: discord.Role | None = None,
+                       pilot: discord.Role | None = None, crafter: discord.Role | None = None,
+                       electric: discord.Role | None = None, farmer: discord.Role | None = None,
+                       builder: discord.Role | None = None, main_group: discord.Role | None = None,
+                       second_group: discord.Role | None = None):
+    if not await admin_only(interaction):
+        return
+    supplied = {
+        "ticket_role_coller": coller,
+        "ticket_role_combat": combat,
+        "ticket_role_fpv": fpv,
+        "ticket_role_pilot": pilot,
+        "ticket_role_crafter": crafter,
+        "ticket_role_electric": electric,
+        "ticket_role_farmer": farmer,
+        "ticket_role_builder": builder,
+        "ticket_group_main": main_group,
+        "ticket_group_second": second_group,
+    }
+    changed = [role for role in supplied.values() if role is not None]
+    for key, role in supplied.items():
+        if role is not None:
+            store.cfg[key] = role.id
+    if changed:
+        store.save()
+
+    labels = {
+        "ticket_role_coller": "Коллер", "ticket_role_combat": "Комбат",
+        "ticket_role_fpv": "FPV-пилот", "ticket_role_pilot": "Пилот",
+        "ticket_role_crafter": "Крафтер", "ticket_role_electric": "Электрик",
+        "ticket_role_farmer": "Фермер", "ticket_role_builder": "Билдер",
+        "ticket_group_main": "Доп. роль Мейн", "ticket_group_second": "Доп. роль второго состава",
+    }
+    lines = ["**Роли для принятых анкет:**"]
+    for key, label in labels.items():
+        role = interaction.guild.get_role(cfg_id(key))
+        lines.append(f"• {label}: {role.mention if role else 'не настроена'}")
+    if changed:
+        lines.insert(0, "Настройки сохранены.\n")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True, allowed_mentions=NO_PINGS)
 
 
 async def send_who_plays(interaction: discord.Interaction):
