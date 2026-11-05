@@ -1292,6 +1292,14 @@ def ticket_role_label(role: str) -> str:
     return "FPV-пилот" if role == "fpv-пилот" else role.capitalize()
 
 
+def ticket_role_option(role: str, kind: str) -> discord.SelectOption:
+    description = None
+    if kind == "main":
+        hours = "8к" if role == "коллер" else "4к"
+        description = f"От {hours} часов · only x3d"
+    return discord.SelectOption(label=ticket_role_label(role), value=role, description=description)
+
+
 def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
     """Доступ к тикету: автор, бот, настроенный стафф и административные роли."""
     P = discord.PermissionOverwrite
@@ -1384,10 +1392,7 @@ class TicketPanelView(discord.ui.View):
                 min_values=1,
                 max_values=1,
                 custom_id=f"ticket:role:{kind}",
-                options=[
-                    discord.SelectOption(label=ticket_role_label(role), value=role)
-                    for role in TICKET_ROLES
-                ],
+                options=[ticket_role_option(role, kind) for role in TICKET_ROLES],
             )
             self.role_select.callback = self.select_role
             self.add_item(self.role_select)
