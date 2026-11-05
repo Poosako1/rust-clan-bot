@@ -1484,7 +1484,7 @@ async def ensure_ticket_log_channels(guild: discord.Guild, category=None) -> lis
     return channels
 
 
-async def save_ticket_transcript(channel: discord.TextChannel, closer) -> tuple[bool, str]:
+async def save_ticket_transcript(channel: discord.TextChannel) -> tuple[bool, str]:
     if not MESSAGE_CONTENT_OK:
         return False, ("В Discord Developer Portal включи Bot → Privileged Gateway Intents → "
                        "Message Content Intent и перезапусти бота.")
@@ -1492,7 +1492,7 @@ async def save_ticket_transcript(channel: discord.TextChannel, closer) -> tuple[
     match = re.search(r"^ticket:(main|second|support) owner:(\d+)", topic)
     if not match:
         return False, "Не удалось определить тип и автора тикета."
-    kind, owner_id = match.group(1), int(match.group(2))
+    kind = match.group(1)
     log_key = "ticket_support_logs" if kind == "support" else "ticket_application_logs"
     log_name = "логи-поддержки" if kind == "support" else "логи-анкет"
     log_channel = channel.guild.get_channel(cfg_id(log_key)) or discord.utils.get(
@@ -1524,20 +1524,9 @@ async def save_ticket_transcript(channel: discord.TextChannel, closer) -> tuple[
                 lines.append(f"  {field.name}: {field.value}")
 
     transcript = "\n".join(lines).encode("utf-8")
-    owner = channel.guild.get_member(owner_id)
-    kind_label = {"main": "Анкета в Мейн", "second": "Анкета во второй состав",
-                  "support": "Поддержка"}[kind]
-    summary = discord.Embed(title=f"Закрыт тикет #{channel.name}", colour=0xED4245)
-    summary.add_field(name="Тип", value=kind_label, inline=True)
-    summary.add_field(name="Автор", value=owner.mention if owner else f"<@{owner_id}>", inline=True)
-    summary.add_field(name="Закрыл", value=closer.mention, inline=True)
-    summary.add_field(name="Сообщений", value=str(len(messages)), inline=True)
-    summary.set_footer(text="CL Team")
     try:
         await log_channel.send(
-            embed=summary,
             file=discord.File(io.BytesIO(transcript), filename=f"transcript-{channel.name}.txt"),
-            allowed_mentions=NO_PINGS,
         )
     except Exception as e:
         return False, f"Не удалось сохранить лог: {short_error(e)}"
@@ -1563,7 +1552,7 @@ class TicketCloseConfirmView(discord.ui.View):
             await interaction.response.edit_message(content="У тебя нет права закрыть этот тикет.", view=None)
             return
         await interaction.response.defer(ephemeral=True)
-        saved, detail = await save_ticket_transcript(channel, interaction.user)
+        saved, detail = await save_ticket_transcript(channel)
         if not saved:
             await interaction.edit_original_response(content=f"Тикет не закрыт. {detail}", view=None)
             return
