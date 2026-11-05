@@ -1243,6 +1243,8 @@ TICKET_TYPES = {
         "button": "Открыть анкету в Мейн",
         "emoji": "👑",
         "color": 0xF1C40F,
+        "panel_title": "МЕЙН СОСТАВ",
+        "menu": "Мейн",
         "title": "Набор в Мейн состав",
         "description": ("Хочешь попасть в основной состав? Создай тикет и расскажи о себе.\n\n"
                         "Набираем игроков только с x3d.\n"
@@ -1255,6 +1257,8 @@ TICKET_TYPES = {
         "button": "Открыть анкету во второй состав",
         "emoji": "⚔️",
         "color": 0x5865F2,
+        "panel_title": "ВТОРОЙ СОСТАВ",
+        "menu": "Второй состав",
         "title": "Набор во второй состав",
         "description": ("Хочешь присоединиться ко второму составу? Создай тикет и расскажи о себе.\n\n"
                         "Ищем игроков с онлайном от 8+ часов в день."),
@@ -1266,6 +1270,7 @@ TICKET_TYPES = {
         "button": "Связаться с поддержкой",
         "emoji": "🛟",
         "color": 0x57F287,
+        "panel_title": "ПОДДЕРЖКА",
         "title": "Поддержка сервера",
         "description": ("Возник вопрос или нужна помощь? Создай личный тикет и подробно опиши ситуацию.\n\n"
                         "Обращение увидит только администрация сервера."),
@@ -1275,6 +1280,13 @@ TICKET_TYPES = {
     },
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
+TICKET_ROLE_EMOJIS = {
+    "коллер": "📣",
+    "комбат": "🔫",
+    "билдер": "🏗️",
+    "фермер": "⛏️",
+    "электрик": "⚡",
+}
 
 
 def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
@@ -1307,7 +1319,7 @@ def next_ticket_number(guild: discord.Guild, kind: str) -> int:
     return max([int(store.ticket_counters.get(key, 0)), *existing], default=0) + 1
 
 
-async def create_ticket(interaction: discord.Interaction, kind: str) -> None:
+async def create_ticket(interaction: discord.Interaction, kind: str, selected_role: str | None = None) -> None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Тикеты можно создавать только на сервере.", ephemeral=True)
         return
@@ -1337,8 +1349,10 @@ async def create_ticket(interaction: discord.Interaction, kind: str) -> None:
             colour=settings["color"],
         )
         embed.add_field(name="Автор тикета", value=interaction.user.mention, inline=True)
+        if selected_role:
+            role_emoji = TICKET_ROLE_EMOJIS.get(selected_role, "🎮")
+            embed.add_field(name="Направление", value=f"{role_emoji} {selected_role.capitalize()}", inline=True)
         embed.add_field(name="Статус", value="🟢 Ожидает ответа", inline=True)
-        embed.set_footer(text="Этот канал доступен только вам и администрации")
         await channel.send(
             f"{interaction.user.mention}{staff_mention}",
             embed=embed,
@@ -1358,13 +1372,31 @@ class TicketPanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.kind = kind
         settings = TICKET_TYPES[kind]
-        button = discord.ui.Button(label=settings["button"], style=settings["style"],
-                                   emoji=settings["emoji"], custom_id=f"ticket:create:{kind}")
-        button.callback = self.open_ticket
-        self.add_item(button)
+        if kind in ("main", "second"):
+            self.role_select = discord.ui.Select(
+                placeholder=f"Выбрать направление · {settings['menu']}",
+                min_values=1,
+                max_values=1,
+                custom_id=f"ticket:role:{kind}",
+                options=[
+                    discord.SelectOption(label=role.capitalize(), value=role,
+                                         emoji=TICKET_ROLE_EMOJIS[role])
+                    for role in ROLES
+                ],
+            )
+            self.role_select.callback = self.select_role
+            self.add_item(self.role_select)
+        else:
+            button = discord.ui.Button(label=settings["button"], style=settings["style"],
+                                       emoji=settings["emoji"], custom_id=f"ticket:create:{kind}")
+            button.callback = self.open_ticket
+            self.add_item(button)
 
     async def open_ticket(self, interaction: discord.Interaction):
         await create_ticket(interaction, self.kind)
+
+    async def select_role(self, interaction: discord.Interaction):
+        await create_ticket(interaction, self.kind, self.role_select.values[0])
 
 
 # ---------- бот ----------
@@ -1559,10 +1591,11 @@ async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None
     await interaction.response.defer(ephemeral=True)
     settings = TICKET_TYPES[kind]
     embed = discord.Embed(
-        title=f"{settings['emoji']} {settings['title']}",
+        title=f"{settings['emoji']} {settings['panel_title']}",
         description=settings["description"],
         colour=settings["color"],
     )
+    embed.set_author(name="CL TEAM • ПОДАТЬ ЗАЯВКУ" if kind != "support" else "CL TEAM • ПОДДЕРЖКА")
     embed.set_footer(text="CL Team")
     try:
         await interaction.channel.send(
