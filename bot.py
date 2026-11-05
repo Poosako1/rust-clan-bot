@@ -87,6 +87,7 @@ class Store:
         self.drafts: dict[str, dict] = {}   # id черновика -> {channel_id, text, author_id, ts}
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
+        self.ticket_counters: dict[str, int] = {}  # guild_id:тип -> последний номер тикета
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -97,6 +98,7 @@ class Store:
             self.statuses = d.get("statuses", {})
             self.drafts = d.get("drafts", {})
             self.cfg = d.get("cfg", {})
+            self.ticket_counters = d.get("ticket_counters", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -109,7 +111,8 @@ class Store:
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
                                    "checks": self.checks, "statuses": self.statuses,
-                                   "drafts": self.drafts, "cfg": self.cfg}), encoding="utf-8")
+                                   "drafts": self.drafts, "cfg": self.cfg,
+                                   "ticket_counters": self.ticket_counters}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -1221,6 +1224,117 @@ class WipeView(discord.ui.View):
         await interaction.response.send_modal(WipeModal())
 
 
+# ---------- тикеты ----------
+TICKET_TYPES = {
+    "main": {
+        "prefix": "main",
+        "button": "Подать анкету в Main",
+        "title": "Анкета в Main состав",
+        "description": "Нажми кнопку, чтобы открыть приватный тикет для подачи анкеты в основной состав.",
+        "welcome": "Отправь здесь свою анкету в Main состав. Стафф ответит в этом канале.",
+        "style": discord.ButtonStyle.primary,
+    },
+    "second": {
+        "prefix": "second",
+        "button": "Подать анкету во второй состав",
+        "title": "Анкета во второй состав",
+        "description": "Нажми кнопку, чтобы открыть приватный тикет для подачи анкеты во второй состав.",
+        "welcome": "Отправь здесь свою анкету во второй состав. Стафф ответит в этом канале.",
+        "style": discord.ButtonStyle.success,
+    },
+    "support": {
+        "prefix": "support",
+        "button": "Обратиться в поддержку",
+        "title": "Поддержка",
+        "description": "Нажми кнопку, чтобы создать приватный канал с поддержкой.",
+        "welcome": "Опиши здесь свой вопрос или проблему. Стафф ответит в этом канале.",
+        "style": discord.ButtonStyle.secondary,
+    },
+}
+_ticket_locks: dict[str, asyncio.Lock] = {}
+
+
+def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
+    """Доступ к тикету: автор, бот, настроенный стафф и административные роли."""
+    P = discord.PermissionOverwrite
+    access = P(view_channel=True, send_messages=True, read_message_history=True, attach_files=True,
+               embed_links=True)
+    overwrites = {guild.default_role: P(view_channel=False), opener: access}
+    if guild.me is not None:
+        overwrites[guild.me] = P(view_channel=True, send_messages=True, read_message_history=True,
+                                 attach_files=True, embed_links=True, manage_channels=True,
+                                 manage_messages=True)
+    configured_staff = guild.get_role(staff_role_id())
+    if configured_staff is not None:
+        overwrites[configured_staff] = access
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        if role.permissions.administrator or role.permissions.manage_guild:
+            overwrites[role] = access
+    return overwrites
+
+
+def next_ticket_number(guild: discord.Guild, kind: str) -> int:
+    """Следующий номер с учётом сохранённого счётчика и уже существующих каналов."""
+    prefix = TICKET_TYPES[kind]["prefix"]
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+    existing = [int(m.group(1)) for ch in guild.text_channels if (m := pattern.fullmatch(ch.name))]
+    key = f"{guild.id}:{kind}"
+    return max([int(store.ticket_counters.get(key, 0)), *existing], default=0) + 1
+
+
+async def create_ticket(interaction: discord.Interaction, kind: str) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Тикеты можно создавать только на сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    settings = TICKET_TYPES[kind]
+    lock_key = f"{guild.id}:{kind}"
+    lock = _ticket_locks.setdefault(lock_key, asyncio.Lock())
+    try:
+        async with lock:
+            number = next_ticket_number(guild, kind)
+            name = f"{settings['prefix']}-{number}"
+            channel = await guild.create_text_channel(
+                name,
+                category=getattr(interaction.channel, "category", None),
+                overwrites=ticket_overwrites(guild, interaction.user),
+                topic=f"ticket:{kind} owner:{interaction.user.id}",
+                reason=f"{settings['title']}: {interaction.user}",
+            )
+            store.ticket_counters[lock_key] = number
+            store.save()
+        staff = guild.get_role(staff_role_id())
+        staff_mention = f" {staff.mention}" if staff is not None else ""
+        await channel.send(
+            f"{interaction.user.mention}{staff_mention}\n**{settings['title']}**\n{settings['welcome']}",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+        await interaction.followup.send(f"Тикет создан: {channel.mention}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Не получилось создать тикет. Дай боту право «Управлять каналами».", ephemeral=True)
+    except Exception as e:
+        print(f"Не удалось создать тикет {kind}: {short_error(e)}", flush=True)
+        await interaction.followup.send(f"Не получилось создать тикет: {short_error(e)}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, kind: str):
+        super().__init__(timeout=None)
+        self.kind = kind
+        settings = TICKET_TYPES[kind]
+        button = discord.ui.Button(label=settings["button"], style=settings["style"],
+                                   custom_id=f"ticket:create:{kind}")
+        button.callback = self.open_ticket
+        self.add_item(button)
+
+    async def open_ticket(self, interaction: discord.Interaction):
+        await create_ticket(interaction, self.kind)
+
+
 # ---------- бот ----------
 class Bot(discord.Client):
     def __init__(self):
@@ -1236,6 +1350,8 @@ class Bot(discord.Client):
         self.add_view(WipeView())
         self.add_view(StatusView())
         self.add_view(AdminView())
+        for kind in TICKET_TYPES:
+            self.add_view(TicketPanelView(kind))
         await self.tree.sync()
         self.daily_report.start()
         self.wipe_tick.start()
@@ -1403,6 +1519,46 @@ async def status_panel(interaction: discord.Interaction):
         view=StatusView(),
     )
     await interaction.response.send_message("Кнопки выложены.", ephemeral=True)
+
+
+async def send_ticket_panel(interaction: discord.Interaction, kind: str) -> None:
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    settings = TICKET_TYPES[kind]
+    try:
+        await interaction.channel.send(
+            f"**{settings['title']}**\n{settings['description']}",
+            view=TicketPanelView(kind),
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Не могу отправить панель в этот канал. Проверь права бота.", ephemeral=True)
+        return
+    except Exception as e:
+        print(f"Не удалось выложить панель {kind}: {short_error(e)}", flush=True)
+        await interaction.followup.send(
+            f"Не получилось выложить панель: {short_error(e)}", ephemeral=True)
+        return
+    await interaction.followup.send("Панель выложена.", ephemeral=True)
+
+
+@bot.tree.command(name="main_panel", description="Выложить панель анкеты в Main состав")
+@app_commands.default_permissions(manage_guild=True)
+async def main_panel(interaction: discord.Interaction):
+    await send_ticket_panel(interaction, "main")
+
+
+@bot.tree.command(name="second_panel", description="Выложить панель анкеты во второй состав")
+@app_commands.default_permissions(manage_guild=True)
+async def second_panel(interaction: discord.Interaction):
+    await send_ticket_panel(interaction, "second")
+
+
+@bot.tree.command(name="support_panel", description="Выложить панель поддержки")
+@app_commands.default_permissions(manage_guild=True)
+async def support_panel(interaction: discord.Interaction):
+    await send_ticket_panel(interaction, "support")
 
 
 async def send_who_plays(interaction: discord.Interaction):
