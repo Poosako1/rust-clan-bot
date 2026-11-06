@@ -85,6 +85,7 @@ class Store:
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         self.ticket_counters: dict[str, int] = {}  # guild_id:тип -> последний номер тикета
         self.private_invites: dict[str, dict] = {}  # discord id -> ожидаемая приватка и роль после принятия
+        self.wipe_events: dict[str, dict] = {}  # id -> сбор с голосами ✅/❌/❓
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -97,6 +98,7 @@ class Store:
             self.cfg = d.get("cfg", {})
             self.ticket_counters = d.get("ticket_counters", {})
             self.private_invites = d.get("private_invites", {})
+            self.wipe_events = d.get("wipe_events", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -116,7 +118,8 @@ class Store:
                                    "checks": self.checks, "statuses": self.statuses,
                                    "drafts": self.drafts, "cfg": self.cfg,
                                    "ticket_counters": self.ticket_counters,
-                                   "private_invites": self.private_invites}), encoding="utf-8")
+                                   "private_invites": self.private_invites,
+                                   "wipe_events": self.wipe_events}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -1089,6 +1092,196 @@ class WipeModal(SafeModal, title="Новый вайп"):
         await interaction.channel.send(
             f"📅 **{name}** запланирован: {fmt_dt(start)} — {fmt_dt(end)}. "
             f"В момент старта бот отметит, кто в голосовом канале.")
+
+
+WIPE_RSVP_LABELS = {"yes": "Иду", "no": "Отсутствую", "late": "Опоздаю"}
+WIPE_RSVP_EMOJIS = {"yes": "✅", "no": "❌", "late": "❓"}
+
+
+def wipe_event_datetime(date_text: str, time_text: str) -> float:
+    combined = f"{date_text.strip()} {time_text.strip()}".replace("/", ".")
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M", "%d.%m %H:%M"):
+        try:
+            value = dt.datetime.strptime(combined, fmt)
+        except ValueError:
+            continue
+        if fmt == "%d.%m %H:%M":
+            value = value.replace(year=dt.datetime.now(TZ).year)
+        return value.replace(tzinfo=TZ).timestamp()
+    raise ValueError(combined)
+
+
+def wipe_event_embed(event: dict) -> discord.Embed:
+    votes = event.get("votes", {})
+    participants = event.get("participants", [])
+    counts = {key: sum(1 for vote in votes.values() if vote.get("status") == key)
+              for key in WIPE_RSVP_LABELS}
+    unanswered = max(0, len(participants) - len(votes))
+    started = event.get("status") == "started" or event["start"] <= time.time()
+    embed = discord.Embed(
+        title=event["name"],
+        description=event.get("description") or "Сбор на вайп",
+        color=0xE67E22 if not started else 0x2F3136,
+        timestamp=dt.datetime.fromtimestamp(event["start"], dt.timezone.utc),
+    )
+    embed.add_field(
+        name="Дата и время сбора",
+        value=f"<t:{int(event['start'])}:F>\n<t:{int(event['start'])}:R>",
+        inline=False,
+    )
+    embed.add_field(name="✅ Иду", value=str(counts["yes"]), inline=True)
+    embed.add_field(name="❌ Отсутствую", value=str(counts["no"]), inline=True)
+    embed.add_field(name="❓ Опоздаю", value=str(counts["late"]), inline=True)
+    embed.add_field(name="Не ответили", value=str(unanswered), inline=True)
+    embed.set_footer(text="Сбор уже начался" if started else "Ответ можно изменить до начала сбора")
+    return embed
+
+
+async def refresh_wipe_event_message(client: discord.Client, event: dict) -> None:
+    channel = client.get_channel(int(event["channel_id"]))
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(int(event["channel_id"]))
+        except Exception:
+            return
+    try:
+        message = await channel.fetch_message(int(event["message_id"]))
+        disabled = event.get("status") != "open" or event["start"] <= time.time()
+        await message.edit(embed=wipe_event_embed(event),
+                           view=WipeRsvpView(event["id"], disabled=disabled))
+    except Exception as e:
+        print(f"Не удалось обновить карточку сбора {event.get('id')}: {short_error(e)}", flush=True)
+
+
+async def record_wipe_event_vote(interaction: discord.Interaction, event_id: str,
+                                 status: str, reason: str = "") -> None:
+    event = store.wipe_events.get(event_id)
+    if event is None or int(event.get("guild_id", 0)) != interaction.guild_id:
+        await interaction.response.send_message("Этот сбор больше не найден.", ephemeral=True)
+        return
+    if event.get("status") != "open" or event["start"] <= time.time():
+        await interaction.response.send_message("Голосование уже закрыто.", ephemeral=True)
+        return
+    if str(interaction.user.id) not in {str(uid) for uid in event.get("participants", [])}:
+        await interaction.response.send_message("Ты не входишь в список участников этого сбора.", ephemeral=True)
+        return
+    event.setdefault("votes", {})[str(interaction.user.id)] = {
+        "status": status,
+        "reason": reason.strip(),
+        "updated": time.time(),
+    }
+    store.save()
+    await interaction.response.send_message(
+        f"Ответ сохранён: {WIPE_RSVP_EMOJIS[status]} **{WIPE_RSVP_LABELS[status]}**.",
+        ephemeral=True,
+    )
+    await refresh_wipe_event_message(interaction.client, event)
+
+
+class WipeRsvpReasonModal(SafeModal):
+    def __init__(self, event_id: str, status: str):
+        title = "Причина отсутствия" if status == "no" else "Причина опоздания"
+        super().__init__(title=title)
+        self.event_id = event_id
+        self.status = status
+        self.reason = discord.ui.TextInput(
+            label=title,
+            placeholder="Напиши причину подробно",
+            style=discord.TextStyle.paragraph,
+            min_length=3,
+            max_length=500,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await record_wipe_event_vote(interaction, self.event_id, self.status, self.reason.value)
+
+
+class WipeRsvpView(discord.ui.View):
+    def __init__(self, event_id: str, disabled: bool = False):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+        choices = (
+            ("Иду", "yes", discord.ButtonStyle.success, "✅"),
+            ("Отсутствую", "no", discord.ButtonStyle.danger, "❌"),
+            ("Опоздаю", "late", discord.ButtonStyle.secondary, "❓"),
+        )
+        for label, status, style, emoji in choices:
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                emoji=emoji,
+                disabled=disabled,
+                custom_id=f"wipe:rsvp:{event_id}:{status}",
+            )
+            button.callback = self._callback(status)
+            self.add_item(button)
+
+    def _callback(self, status: str):
+        async def callback(interaction: discord.Interaction):
+            event = store.wipe_events.get(self.event_id)
+            if event is None or event.get("status") != "open" or event["start"] <= time.time():
+                await interaction.response.send_message("Голосование уже закрыто.", ephemeral=True)
+                return
+            if str(interaction.user.id) not in {str(uid) for uid in event.get("participants", [])}:
+                await interaction.response.send_message("Ты не входишь в список участников этого сбора.",
+                                                        ephemeral=True)
+                return
+            if status in ("no", "late"):
+                await interaction.response.send_modal(WipeRsvpReasonModal(self.event_id, status))
+                return
+            await record_wipe_event_vote(interaction, self.event_id, status)
+        return callback
+
+
+async def send_wipe_event_dm(member: discord.Member, event: dict, jump_url: str,
+                             reminder: bool = False) -> bool:
+    prefix = "Ты ещё не ответил на сбор." if reminder else "Создан новый сбор на вайп."
+    try:
+        await member.send(
+            f"**{prefix}**\n\n"
+            f"**{event['name']}**\n{event.get('description') or 'Сбор на вайп'}\n"
+            f"Дата и время: <t:{int(event['start'])}:F>\n"
+            f"Проголосовать: {jump_url}",
+            allowed_mentions=NO_PINGS,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def process_wipe_event_reminders(client: discord.Client) -> None:
+    now = dt.datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+    changed = False
+    for event in store.wipe_events.values():
+        if event.get("status") != "open":
+            continue
+        if event["start"] <= now.timestamp():
+            event["status"] = "started"
+            changed = True
+            await refresh_wipe_event_message(client, event)
+            continue
+        if now.hour < 12 or event.get("last_reminder_date") == today:
+            continue
+        guild = client.get_guild(int(event["guild_id"]))
+        channel = client.get_channel(int(event["channel_id"]))
+        if guild is None or channel is None:
+            continue
+        jump_url = f"https://discord.com/channels/{event['guild_id']}/{event['channel_id']}/{event['message_id']}"
+        voted = {str(uid) for uid in event.get("votes", {})}
+        for uid in event.get("participants", []):
+            if str(uid) in voted:
+                continue
+            member = guild.get_member(int(uid))
+            if member is None:
+                continue
+            await send_wipe_event_dm(member, event, jump_url, reminder=True)
+            await asyncio.sleep(0.2)
+        event["last_reminder_date"] = today
+        changed = True
+    if changed:
+        store.save()
 
 
 def parse_day_end(text: str) -> float:
@@ -2162,6 +2355,9 @@ class Bot(discord.Client):
         self.add_view(TicketRoleSyncView())
         for kind in TICKET_TYPES:
             self.add_view(TicketPanelView(kind))
+        for event in store.wipe_events.values():
+            if event.get("status") == "open" and event.get("message_id"):
+                self.add_view(WipeRsvpView(event["id"]), message_id=int(event["message_id"]))
         await self.tree.sync()
         self.wipe_tick.start()
 
@@ -2286,6 +2482,10 @@ class Bot(discord.Client):
                     await finish_wipe(self, w)
             except Exception as e:
                 print(f"Ошибка вайпа «{w['name']}»: {e}", flush=True)
+        try:
+            await process_wipe_event_reminders(self)
+        except Exception as e:
+            print(f"Ошибка напоминаний о сборах: {short_error(e)}", flush=True)
 
     @wipe_tick.before_loop
     async def _wait(self):
@@ -2334,6 +2534,164 @@ async def wipe_panel(interaction: discord.Interaction):
         view=WipeView(),
     )
     await interaction.response.send_message("Кнопка выложена.", ephemeral=True)
+
+
+@bot.tree.command(name="wipe", description="Создать сбор на вайп с голосованием")
+@app_commands.describe(
+    name="Название события",
+    description="Описание сбора",
+    event_date="Дата сбора: ДД.ММ.ГГГГ",
+    event_time="Время сбора: ЧЧ:ММ по Москве",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def wipe_event(interaction: discord.Interaction, name: str, description: str,
+                     event_date: str, event_time: str):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    try:
+        start = wipe_event_datetime(event_date, event_time)
+    except ValueError:
+        await interaction.response.send_message(
+            "Не разобрал дату или время. Пример: `дата: 10.11.2026`, `время: 19:30`.",
+            ephemeral=True,
+        )
+        return
+    if start <= time.time():
+        await interaction.response.send_message("Дата и время сбора должны быть в будущем.", ephemeral=True)
+        return
+    if not name.strip() or len(name.strip()) > 100 or len(description.strip()) > 1000:
+        await interaction.response.send_message(
+            "Название должно быть до 100 символов, описание — до 1000.", ephemeral=True)
+        return
+    duplicate = any(
+        event.get("guild_id") == interaction.guild.id
+        and event.get("status") == "open"
+        and event.get("name", "").casefold() == name.strip().casefold()
+        for event in store.wipe_events.values()
+    )
+    if duplicate:
+        await interaction.response.send_message("Открытый сбор с таким названием уже существует.", ephemeral=True)
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Не включён Server Members Intent — бот не сможет разослать событие всем участникам.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        participants = [member async for member in interaction.guild.fetch_members(limit=None)
+                        if not member.bot]
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось получить список участников: {short_error(e)}", ephemeral=True)
+        return
+    if not participants:
+        await interaction.followup.send("На сервере не найдено участников для голосования.", ephemeral=True)
+        return
+
+    event_id = f"{interaction.guild.id:x}-{int(time.time()):x}"
+    event = {
+        "id": event_id,
+        "guild_id": interaction.guild.id,
+        "channel_id": interaction.channel_id,
+        "message_id": 0,
+        "name": name.strip(),
+        "description": description.strip(),
+        "start": start,
+        "created": time.time(),
+        "created_by": interaction.user.id,
+        "participants": [member.id for member in participants],
+        "votes": {},
+        "status": "open",
+        "last_reminder_date": dt.datetime.now(TZ).strftime("%Y-%m-%d"),
+    }
+    try:
+        message = await interaction.channel.send(
+            embed=wipe_event_embed(event),
+            view=WipeRsvpView(event_id),
+            allowed_mentions=NO_PINGS,
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось создать карточку события: {short_error(e)}", ephemeral=True)
+        return
+    event["message_id"] = message.id
+    store.wipe_events[event_id] = event
+    store.save()
+
+    delivered = 0
+    for member in participants:
+        if await send_wipe_event_dm(member, event, message.jump_url):
+            delivered += 1
+        await asyncio.sleep(0.2)
+    failed = len(participants) - delivered
+    await interaction.followup.send(
+        f"Сбор создан: {message.jump_url}\n"
+        f"Участников: **{len(participants)}**. Личные сообщения доставлены: **{delivered}**. "
+        f"Не доставлены: **{failed}**.",
+        ephemeral=True,
+    )
+
+
+def guild_wipe_events(guild_id: int) -> list[dict]:
+    return sorted(
+        (event for event in store.wipe_events.values() if int(event.get("guild_id", 0)) == guild_id),
+        key=lambda event: event.get("start", 0),
+        reverse=True,
+    )
+
+
+@bot.tree.command(name="wipe_reasons", description="Посмотреть причины отсутствия и опоздания")
+@app_commands.describe(event="Выбери сбор")
+@app_commands.default_permissions(manage_guild=True)
+async def wipe_reasons(interaction: discord.Interaction, event: str | None = None):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    events = guild_wipe_events(interaction.guild.id)
+    selected = store.wipe_events.get(event) if event else (events[0] if events else None)
+    if selected is None or int(selected.get("guild_id", 0)) != interaction.guild.id:
+        await interaction.response.send_message("Сбор не найден.", ephemeral=True)
+        return
+
+    lines = [f"**Причины · {selected['name']}**", f"Сбор: <t:{int(selected['start'])}:F>", ""]
+    reason_votes = [(uid, vote) for uid, vote in selected.get("votes", {}).items()
+                    if vote.get("status") in ("no", "late")]
+    if not reason_votes:
+        lines.append("Причин отсутствия или опоздания пока нет.")
+    else:
+        for uid, vote in reason_votes:
+            member = interaction.guild.get_member(int(uid))
+            name_text = discord.utils.escape_markdown(member.display_name) if member else f"ID {uid}"
+            label = f"{WIPE_RSVP_EMOJIS[vote['status']]} {WIPE_RSVP_LABELS[vote['status']]}"
+            reason = discord.utils.escape_markdown(vote.get("reason") or "Причина не указана")
+            lines.append(f"• **{name_text}** — {label}\n  {reason}")
+    await interaction.response.defer(ephemeral=True)
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+@wipe_reasons.autocomplete("event")
+async def wipe_reasons_autocomplete(interaction: discord.Interaction, current: str):
+    if interaction.guild is None:
+        return []
+    current_folded = current.casefold()
+    choices = []
+    for event in guild_wipe_events(interaction.guild.id):
+        if current_folded and current_folded not in event.get("name", "").casefold():
+            continue
+        date = dt.datetime.fromtimestamp(event["start"], TZ).strftime("%d.%m %H:%M")
+        choices.append(app_commands.Choice(name=f"{event['name']} · {date}"[:100], value=event["id"]))
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 @bot.tree.command(name="status_panel", description="Выложить кнопки «Инактив» и «АФК» (для админов)")
