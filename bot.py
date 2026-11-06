@@ -1306,21 +1306,56 @@ async def send_wipe_event_final(client: discord.Client, event: dict) -> None:
         await channel.send(chunk, allowed_mentions=NO_PINGS)
 
 
+async def notify_wipe_event_attendees(client: discord.Client, event: dict) -> None:
+    """В момент сбора написать в личку каждому, кто выбрал ✅ «Иду»."""
+    guild = client.get_guild(int(event["guild_id"]))
+    if guild is None:
+        return
+    notified = {str(user_id) for user_id in event.get("start_notified", [])}
+    for user_id in wipe_event_status_ids(event, "yes"):
+        if str(user_id) in notified:
+            continue
+        member = guild.get_member(user_id)
+        if member is not None:
+            try:
+                await member.send(
+                    f"<@{user_id}>, **{event['name']}** — заходи в войс, время пришло!",
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+            except Exception:
+                pass
+        notified.add(str(user_id))
+        event["start_notified"] = sorted(notified)
+        store.save()
+        await asyncio.sleep(0.2)
+    event["start_notifications_done"] = True
+    store.save()
+
+
 async def process_wipe_event_reminders(client: discord.Client) -> None:
     now = dt.datetime.now(TZ)
     today = now.strftime("%Y-%m-%d")
     changed = False
     for event in store.wipe_events.values():
-        if event.get("status") != "open":
+        if event.get("status") not in ("open", "started"):
             continue
         if event["start"] <= now.timestamp():
-            event["status"] = "started"
-            changed = True
-            await refresh_wipe_event_message(client, event)
-            try:
-                await send_wipe_event_final(client, event)
-            except Exception as e:
-                print(f"Не удалось отправить итоги сбора {event.get('id')}: {short_error(e)}", flush=True)
+            if not event.get("start_notifications_done"):
+                await notify_wipe_event_attendees(client, event)
+            if event.get("status") != "started":
+                event["status"] = "started"
+                changed = True
+                await refresh_wipe_event_message(client, event)
+            if not event.get("final_sent"):
+                try:
+                    await send_wipe_event_final(client, event)
+                except Exception as e:
+                    print(f"Не удалось отправить итоги сбора {event.get('id')}: {short_error(e)}", flush=True)
+                else:
+                    event["final_sent"] = True
+                    changed = True
+            continue
+        if event.get("status") != "open":
             continue
         if now.hour < 12 or event.get("last_reminder_date") == today:
             continue
@@ -2668,6 +2703,9 @@ async def wipe_event(interaction: discord.Interaction, name: str, description: s
         "participants": [member.id for member in participants],
         "votes": {},
         "status": "open",
+        "start_notified": [],
+        "start_notifications_done": False,
+        "final_sent": False,
         "last_reminder_date": dt.datetime.now(TZ).strftime("%Y-%m-%d"),
     }
     try:
