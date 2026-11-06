@@ -1250,6 +1250,43 @@ async def send_wipe_event_dm(member: discord.Member, event: dict, jump_url: str,
         return False
 
 
+def wipe_event_member_name(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    if member is None:
+        return f"Discord ID {user_id}"
+    return discord.utils.escape_markdown(member.display_name)
+
+
+def wipe_event_pending_ids(event: dict) -> list[int]:
+    voted = {str(user_id) for user_id in event.get("votes", {})}
+    return [int(user_id) for user_id in event.get("participants", []) if str(user_id) not in voted]
+
+
+async def send_wipe_event_final(client: discord.Client, event: dict) -> None:
+    guild = client.get_guild(int(event["guild_id"]))
+    channel = client.get_channel(int(event["channel_id"]))
+    if guild is None or channel is None:
+        return
+    votes = event.get("votes", {})
+    counts = {key: sum(1 for vote in votes.values() if vote.get("status") == key)
+              for key in WIPE_RSVP_LABELS}
+    pending_ids = wipe_event_pending_ids(event)
+    lines = [
+        f"**Итоги подтверждения · {discord.utils.escape_markdown(event['name'])}**",
+        f"✅ Идут: **{counts['yes']}**",
+        f"❌ Отсутствуют: **{counts['no']}**",
+        f"❓ Опоздают: **{counts['late']}**",
+        f"⚠️ Не проголосовали: **{len(pending_ids)}**",
+        "",
+        "**Не проголосовали:**",
+    ]
+    lines.extend((f"• {wipe_event_member_name(guild, user_id)}" for user_id in pending_ids))
+    if not pending_ids:
+        lines.append("• Все участники ответили.")
+    for chunk in chunk_lines(lines):
+        await channel.send(chunk, allowed_mentions=NO_PINGS)
+
+
 async def process_wipe_event_reminders(client: discord.Client) -> None:
     now = dt.datetime.now(TZ)
     today = now.strftime("%Y-%m-%d")
@@ -1261,6 +1298,10 @@ async def process_wipe_event_reminders(client: discord.Client) -> None:
             event["status"] = "started"
             changed = True
             await refresh_wipe_event_message(client, event)
+            try:
+                await send_wipe_event_final(client, event)
+            except Exception as e:
+                print(f"Не удалось отправить итоги сбора {event.get('id')}: {short_error(e)}", flush=True)
             continue
         if now.hour < 12 or event.get("last_reminder_date") == today:
             continue
@@ -2678,7 +2719,38 @@ async def wipe_reasons(interaction: discord.Interaction, event: str | None = Non
         await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
 
 
+@bot.tree.command(name="wipe_pending", description="Посмотреть, кто не проголосовал за сбор")
+@app_commands.describe(event="Выбери сбор")
+@app_commands.default_permissions(manage_guild=True)
+async def wipe_pending(interaction: discord.Interaction, event: str | None = None):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    events = guild_wipe_events(interaction.guild.id)
+    selected = store.wipe_events.get(event) if event else (events[0] if events else None)
+    if selected is None or int(selected.get("guild_id", 0)) != interaction.guild.id:
+        await interaction.response.send_message("Сбор не найден.", ephemeral=True)
+        return
+    pending_ids = wipe_event_pending_ids(selected)
+    lines = [
+        f"**Не проголосовали · {discord.utils.escape_markdown(selected['name'])}**",
+        f"Сбор: <t:{int(selected['start'])}:F>",
+        f"Всего: **{len(pending_ids)}**",
+        "",
+    ]
+    lines.extend((f"• {wipe_event_member_name(interaction.guild, user_id)}"
+                  for user_id in pending_ids))
+    if not pending_ids:
+        lines.append("Все участники уже ответили.")
+    await interaction.response.defer(ephemeral=True)
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
 @wipe_reasons.autocomplete("event")
+@wipe_pending.autocomplete("event")
 async def wipe_reasons_autocomplete(interaction: discord.Interaction, current: str):
     if interaction.guild is None:
         return []
