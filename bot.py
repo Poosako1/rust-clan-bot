@@ -84,6 +84,7 @@ class Store:
         self.statuses: dict[str, dict] = {}  # discord id -> {kind, reason, until, since, nick}
         self.checks: dict[str, dict] = {}  # id сообщения сводки -> {rid, uid, nick, line, decision, by_id}
         self.ticket_counters: dict[str, int] = {}  # guild_id:тип -> последний номер тикета
+        self.private_invites: dict[str, dict] = {}  # discord id -> ожидаемая приватка и роль после принятия
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -95,6 +96,7 @@ class Store:
             self.drafts = d.get("drafts", {})
             self.cfg = d.get("cfg", {})
             self.ticket_counters = d.get("ticket_counters", {})
+            self.private_invites = d.get("private_invites", {})
 
     def save(self):
         self.heartbeat = time.time()
@@ -103,12 +105,18 @@ class Store:
         self.checks = {k: v for k, v in self.checks.items() if v["rid"] >= cutoff}
         self.statuses = {k: v for k, v in self.statuses.items() if v["until"] >= time.time() - 86400}
         self.drafts = {k: v for k, v in self.drafts.items() if v["ts"] >= time.time() - 3 * 86400}
+        invite_cutoff = time.time() - 14 * 86400
+        self.private_invites = {
+            k: v for k, v in self.private_invites.items()
+            if float(v.get("created", 0)) >= invite_cutoff
+        }
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
                                    "checks": self.checks, "statuses": self.statuses,
                                    "drafts": self.drafts, "cfg": self.cfg,
-                                   "ticket_counters": self.ticket_counters}), encoding="utf-8")
+                                   "ticket_counters": self.ticket_counters,
+                                   "private_invites": self.private_invites}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -1615,7 +1623,8 @@ async def save_ticket_transcript(channel: discord.TextChannel, close_reason: str
     return True, f"Лог сохранён в {log_channel.mention}."
 
 
-async def grant_accepted_ticket_roles(channel: discord.TextChannel) -> tuple[bool, str]:
+async def grant_accepted_ticket_roles(channel: discord.TextChannel,
+                                      client: discord.Client) -> tuple[bool, str]:
     match = re.search(r"^ticket:(main|second) owner:(\d+) role:([\w-]+)", channel.topic or "")
     if not match:
         return False, "Не удалось определить состав, участника или направление тикета."
@@ -1639,14 +1648,118 @@ async def grant_accepted_ticket_roles(channel: discord.TextChannel) -> tuple[boo
     if missing:
         return False, "Не настроена " + " и ".join(missing) + ". Используй `/ticket_roles`."
 
-    roles = list({direction_role.id: direction_role, group_role.id: group_role}.values())
+    private_guild_id = cfg_id(ticket_sync_source_guild_key(kind))
+    private_guild = client.get_guild(private_guild_id) if private_guild_id else None
+    if private_guild is None:
+        return False, (f"Не настроена приватка «{TICKET_SYNC_TEAM_LABELS[kind]}». "
+                       "Запусти в ней `/ticket_roles` и выбери состав.")
+
+    private_direction_role = private_guild.get_role(
+        cfg_id(ticket_sync_source_role_key(kind, role_slug))
+    )
+    private_member_role = private_guild.get_role(cfg_id(ticket_private_member_role_key(kind)))
+    invite_channel = private_guild.get_channel(cfg_id(ticket_private_invite_channel_key(kind)))
+    if private_direction_role is None:
+        return False, (f"В приватке «{private_guild.name}» не настроена роль "
+                       f"«{TICKET_ROLE_LABELS.get(role_slug, role_slug)}». Используй `/ticket_roles`.")
+    if not isinstance(invite_channel, discord.TextChannel):
+        return False, (f"В приватке «{private_guild.name}» не настроен канал приглашения. "
+                       "Укажи `invite_channel` в `/ticket_roles`.")
+    private_me = private_guild.me
+    if private_me is None or not private_me.guild_permissions.manage_roles:
+        return False, f"У бота в приватке «{private_guild.name}» нет права «Управлять ролями»."
+    private_roles_to_manage = [private_direction_role]
+    if private_member_role is not None:
+        private_roles_to_manage.append(private_member_role)
+    unavailable_private_roles = [
+        role.name for role in private_roles_to_manage
+        if role.managed or role >= private_me.top_role
+    ]
+    if unavailable_private_roles:
+        return False, ("Подними роль бота выше ролей приватки: "
+                       + ", ".join(unavailable_private_roles) + ".")
+    if not invite_channel.permissions_for(private_me).create_instant_invite:
+        return False, (f"У бота нет права «Создавать приглашения» в канале "
+                       f"{invite_channel.mention} приватки «{private_guild.name}».")
+
+    community_roles = list({direction_role.id: direction_role, group_role.id: group_role}.values())
+    community_role_ids_before = {role.id for role in member.roles}
+    private_member = private_guild.get_member(owner_id)
+    if private_member is None:
+        try:
+            private_member = await private_guild.fetch_member(owner_id)
+        except discord.NotFound:
+            private_member = None
+        except discord.Forbidden:
+            return False, f"Бот не может проверить участников приватки «{private_guild.name}»."
+        except Exception as e:
+            return False, f"Не удалось проверить приватку: {short_error(e)}"
+
+    private_roles = list({role.id: role for role in private_roles_to_manage}.values())
+    private_role_ids_before = {role.id for role in private_member.roles} if private_member else set()
+    invite = None
+
     try:
-        await member.add_roles(*roles, reason=f"Принят через тикет #{channel.name}")
+        await member.add_roles(*community_roles, reason=f"Принят через тикет #{channel.name}")
     except discord.Forbidden:
         return False, "Бот не может выдать роли. Подними роль бота выше выдаваемых ролей."
     except Exception as e:
         return False, f"Не удалось выдать роли: {short_error(e)}"
-    return True, "Роли участнику выданы."
+
+    try:
+        if private_member is not None:
+            await private_member.add_roles(*private_roles, reason=f"Принят через тикет #{channel.name}")
+            store.private_invites.pop(str(owner_id), None)
+            store.save()
+            return True, f"Роли выданы в Community и приватке «{private_guild.name}»."
+
+        invite = await invite_channel.create_invite(
+            max_age=7 * 86400,
+            max_uses=1,
+            unique=True,
+            reason=f"Принят через тикет #{channel.name}",
+        )
+        store.private_invites[str(owner_id)] = {
+            "team": kind,
+            "role": role_slug,
+            "created": time.time(),
+            "community_guild_id": channel.guild.id,
+        }
+        store.save()
+        await member.send(
+            f"Твоя анкета в **{channel.guild.name}** принята.\n"
+            f"Приглашение в **{private_guild.name}**: {invite.url}\n\n"
+            "Ссылка одноразовая и действует 7 дней. После входа бот автоматически выдаст роли.",
+            allowed_mentions=NO_PINGS,
+        )
+        return True, f"Роли выданы, приглашение в «{private_guild.name}» отправлено участнику в личку."
+    except discord.Forbidden:
+        detail = ("Бот не может создать приглашение или написать участнику в личку. "
+                  "Проверь право «Создавать приглашения» и попроси участника открыть личные сообщения.")
+    except Exception as e:
+        detail = f"Не удалось пригласить в приватку: {short_error(e)}"
+
+    store.private_invites.pop(str(owner_id), None)
+    store.save()
+    if invite is not None:
+        try:
+            await invite.delete(reason="Не удалось доставить приглашение")
+        except Exception:
+            pass
+    rollback_community = [role for role in community_roles if role.id not in community_role_ids_before]
+    if rollback_community:
+        try:
+            await member.remove_roles(*rollback_community, reason="Откат неудачного принятия в приватку")
+        except Exception:
+            pass
+    if private_member is not None:
+        rollback_private = [role for role in private_roles if role.id not in private_role_ids_before]
+        if rollback_private:
+            try:
+                await private_member.remove_roles(*rollback_private, reason="Откат неудачного принятия")
+            except Exception:
+                pass
+    return False, detail
 
 
 class TicketCloseConfirmView(discord.ui.View):
@@ -1672,7 +1785,7 @@ class TicketCloseConfirmView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         role_detail = ""
         if self.accepted:
-            granted, role_detail = await grant_accepted_ticket_roles(channel)
+            granted, role_detail = await grant_accepted_ticket_roles(channel, interaction.client)
             if not granted:
                 await interaction.edit_original_response(content=f"Тикет не закрыт. {role_detail}", view=None)
                 return
@@ -1745,6 +1858,56 @@ def ticket_sync_source_guild_key(team: str) -> str:
 
 def ticket_sync_source_role_key(team: str, role_slug: str) -> str:
     return f"ticket_sync_source_{team}_{role_slug}"
+
+
+def ticket_private_invite_channel_key(team: str) -> str:
+    return f"ticket_sync_source_{team}_invite_channel"
+
+
+def ticket_private_member_role_key(team: str) -> str:
+    return f"ticket_sync_source_{team}_member_role"
+
+
+async def apply_pending_private_roles(member: discord.Member) -> bool:
+    """Выдать роли принятому игроку сразу после входа в настроенную приватку."""
+    pending = store.private_invites.get(str(member.id))
+    if not pending:
+        return False
+    team = pending.get("team")
+    role_slug = pending.get("role")
+    if team not in TICKET_SYNC_TEAM_LABELS or role_slug not in TICKET_ROLE_LABELS:
+        store.private_invites.pop(str(member.id), None)
+        store.save()
+        return False
+    if cfg_id(ticket_sync_source_guild_key(team)) != member.guild.id:
+        return False
+
+    direction_role = member.guild.get_role(cfg_id(ticket_sync_source_role_key(team, role_slug)))
+    member_role = member.guild.get_role(cfg_id(ticket_private_member_role_key(team)))
+    if direction_role is None:
+        print(f"Не выданы роли {member}: в приватке не настроена роль {role_slug}", flush=True)
+        return False
+    roles = [direction_role]
+    if member_role is not None:
+        roles.append(member_role)
+    roles = [role for role in {role.id: role for role in roles}.values() if role not in member.roles]
+    try:
+        if roles:
+            await member.add_roles(*roles, reason="Автовыдача после принятой анкеты")
+    except Exception as e:
+        print(f"Не удалось выдать роли в приватке участнику {member}: {short_error(e)}", flush=True)
+        return False
+
+    store.private_invites.pop(str(member.id), None)
+    store.save()
+    try:
+        await member.send(
+            f"Добро пожаловать в **{member.guild.name}**. Роли выданы автоматически.",
+            allowed_mentions=NO_PINGS,
+        )
+    except Exception:
+        pass
+    return True
 
 
 async def fetch_all_members(guild: discord.Guild) -> dict[int, discord.Member]:
@@ -2029,6 +2192,11 @@ class Bot(discord.Client):
         except Exception as e:
             print(f"Не удалось синхронизировать команды на новом сервере {guild.id}: {short_error(e)}", flush=True)
 
+    async def on_member_join(self, member: discord.Member):
+        if member.bot:
+            return
+        await apply_pending_private_roles(member)
+
     async def on_invite_delete(self, invite):
         """Логировать удаление инвайта в закрытый канал; исполнитель берётся из Audit Log."""
         channel_id = INVITE_LOG_CHANNEL_ID
@@ -2251,6 +2419,8 @@ async def ticket_logs_setup(interaction: discord.Interaction):
     coller="Роль коллера", combat="Роль комбата", fpv="Роль FPV-пилота",
     pilot="Роль пилота", crafter="Роль крафтера", electric="Роль электрика",
     farmer="Роль фермера", builder="Роль билдера",
+    invite_channel="Канал, на который бот создаёт приглашение в приватку",
+    member_role="Общая роль, которую бот выдаёт всем принятым в этой приватке",
     main_group="Дополнительная роль Мейн состава",
     second_group="Дополнительная роль второго состава",
 )
@@ -2264,7 +2434,10 @@ async def ticket_roles(interaction: discord.Interaction, team: str | None = None
                        combat: discord.Role | None = None, fpv: discord.Role | None = None,
                        pilot: discord.Role | None = None, crafter: discord.Role | None = None,
                        electric: discord.Role | None = None, farmer: discord.Role | None = None,
-                       builder: discord.Role | None = None, main_group: discord.Role | None = None,
+                       builder: discord.Role | None = None,
+                       invite_channel: discord.TextChannel | None = None,
+                       member_role: discord.Role | None = None,
+                       main_group: discord.Role | None = None,
                        second_group: discord.Role | None = None):
     if not await admin_only(interaction):
         return
@@ -2287,18 +2460,36 @@ async def ticket_roles(interaction: discord.Interaction, team: str | None = None
             if role is not None:
                 store.cfg[ticket_sync_source_role_key(team, role_slug)] = role.id
                 changed.append(role)
+        if invite_channel is not None:
+            store.cfg[ticket_private_invite_channel_key(team)] = invite_channel.id
+        if member_role is not None:
+            store.cfg[ticket_private_member_role_key(team)] = member_role.id
+            changed.append(member_role)
         store.save()
         lines = [f"**Роли приватки · {TICKET_SYNC_TEAM_LABELS[team]}:**"]
         for role_slug, label in TICKET_ROLE_LABELS.items():
             role = interaction.guild.get_role(cfg_id(ticket_sync_source_role_key(team, role_slug)))
             if role is not None:
                 lines.append(f"• {label}: {role.mention}")
+        configured_member_role = interaction.guild.get_role(cfg_id(ticket_private_member_role_key(team)))
+        configured_invite_channel = interaction.guild.get_channel(cfg_id(ticket_private_invite_channel_key(team)))
+        if configured_member_role is not None:
+            lines.append(f"• Общая роль приватки: {configured_member_role.mention}")
+        if isinstance(configured_invite_channel, discord.TextChannel):
+            lines.append(f"• Канал приглашения: {configured_invite_channel.mention}")
         if len(lines) == 1:
             lines.append("Настроенных ролей пока нет.")
         if main_group is not None or second_group is not None:
             lines.append("Роли составов настраиваются через `/ticket_roles` только в Community.")
-        lines.insert(0, "Приватка сохранена.\n" if changed else "Приватка выбрана.\n")
+        saved = bool(changed or invite_channel is not None)
+        lines.insert(0, "Приватка сохранена.\n" if saved else "Приватка выбрана.\n")
     else:
+        if invite_channel is not None or member_role is not None:
+            await interaction.followup.send(
+                "`invite_channel` и `member_role` настраиваются только в приватке вместе с параметром `team`.",
+                ephemeral=True,
+            )
+            return
         supplied = {
             **{TICKET_ROLE_CONFIG_KEYS[role_slug]: role for role_slug, role in direction_supplied.items()},
             "ticket_group_main": main_group,
