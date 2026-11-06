@@ -1123,6 +1123,31 @@ def wipe_event_mention_chunks(user_ids: list[int], limit: int = 1000) -> list[st
     return chunks
 
 
+def wipe_event_reason_chunks(event: dict, status: str, limit: int = 1000) -> list[str]:
+    entries = []
+    for user_id, vote in event.get("votes", {}).items():
+        if vote.get("status") != status:
+            continue
+        reason = discord.utils.escape_markdown(vote.get("reason") or "Причина не указана")
+        entries.append(f"<@{int(user_id)}>\nПричина: {reason}")
+    if not entries:
+        return ["—"]
+    chunks = []
+    current = []
+    size = 0
+    for entry in entries:
+        extra = len(entry) + (2 if current else 0)
+        if current and size + extra > limit:
+            chunks.append("\n\n".join(current))
+            current = []
+            size = 0
+        current.append(entry)
+        size += len(entry) + (2 if size else 0)
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
 def wipe_event_datetime(date_text: str, time_text: str) -> float:
     combined = f"{date_text.strip()} {time_text.strip()}".replace("/", ".")
     for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M", "%d.%m %H:%M"):
@@ -1150,15 +1175,15 @@ def wipe_event_embed(event: dict) -> discord.Embed:
         inline=False,
     )
     groups = (
-        ("✅ Иду", wipe_event_status_ids(event, "yes")),
-        ("❌ Отсутствую", wipe_event_status_ids(event, "no")),
-        ("❓ Опоздаю", wipe_event_status_ids(event, "late")),
-        ("⚠️ Не ответили", wipe_event_pending_ids(event)),
+        ("✅ Иду", wipe_event_mention_chunks(wipe_event_status_ids(event, "yes"))),
+        ("❌ Отсутствую", wipe_event_reason_chunks(event, "no")),
+        ("❓ Опоздаю", wipe_event_reason_chunks(event, "late")),
+        ("⚠️ Не ответили", wipe_event_mention_chunks(wipe_event_pending_ids(event))),
     )
-    for title, user_ids in groups:
-        for index, mentions in enumerate(wipe_event_mention_chunks(user_ids)):
+    for title, values in groups:
+        for index, value in enumerate(values):
             field_name = title if index == 0 else f"{title} · продолжение"
-            embed.add_field(name=field_name, value=mentions, inline=False)
+            embed.add_field(name=field_name, value=value, inline=False)
     embed.set_footer(text="Сбор уже начался" if started else "Ответ можно изменить до начала сбора")
     return embed
 
@@ -1299,7 +1324,12 @@ async def send_wipe_event_final(client: discord.Client, event: dict) -> None:
     for title, user_ids in groups:
         lines.extend(("", f"**{title}:**"))
         if user_ids:
-            lines.extend((f"• <@{user_id}> — `{user_id}`" for user_id in user_ids))
+            for user_id in user_ids:
+                lines.append(f"• <@{user_id}> — `{user_id}`")
+                if title.startswith(("❌", "❓")):
+                    vote = event.get("votes", {}).get(str(user_id), {})
+                    reason = discord.utils.escape_markdown(vote.get("reason") or "Причина не указана")
+                    lines.append(f"  Причина: {reason}")
         else:
             lines.append("• Никого")
     for chunk in chunk_lines(lines):
@@ -2766,11 +2796,9 @@ async def wipe_reasons(interaction: discord.Interaction, event: str | None = Non
         lines.append("Причин отсутствия или опоздания пока нет.")
     else:
         for uid, vote in reason_votes:
-            member = interaction.guild.get_member(int(uid))
-            name_text = discord.utils.escape_markdown(member.display_name) if member else f"ID {uid}"
             label = f"{WIPE_RSVP_EMOJIS[vote['status']]} {WIPE_RSVP_LABELS[vote['status']]}"
             reason = discord.utils.escape_markdown(vote.get("reason") or "Причина не указана")
-            lines.append(f"• **{name_text}** — {label}\n  {reason}")
+            lines.append(f"• <@{uid}> — `{uid}` · {label}\n  Причина: {reason}")
     await interaction.response.defer(ephemeral=True)
     for chunk in chunk_lines(lines):
         await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
