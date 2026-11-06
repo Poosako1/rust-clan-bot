@@ -1098,6 +1098,31 @@ WIPE_RSVP_LABELS = {"yes": "Иду", "no": "Отсутствую", "late": "Оп
 WIPE_RSVP_EMOJIS = {"yes": "✅", "no": "❌", "late": "❓"}
 
 
+def wipe_event_status_ids(event: dict, status: str) -> list[int]:
+    return [int(user_id) for user_id, vote in event.get("votes", {}).items()
+            if vote.get("status") == status]
+
+
+def wipe_event_mention_chunks(user_ids: list[int], limit: int = 1000) -> list[str]:
+    if not user_ids:
+        return ["—"]
+    chunks = []
+    current = []
+    size = 0
+    for user_id in user_ids:
+        mention = f"<@{user_id}>"
+        extra = len(mention) + (1 if current else 0)
+        if current and size + extra > limit:
+            chunks.append(" ".join(current))
+            current = []
+            size = 0
+        current.append(mention)
+        size += len(mention) + (1 if size else 0)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
 def wipe_event_datetime(date_text: str, time_text: str) -> float:
     combined = f"{date_text.strip()} {time_text.strip()}".replace("/", ".")
     for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M", "%d.%m %H:%M"):
@@ -1112,11 +1137,6 @@ def wipe_event_datetime(date_text: str, time_text: str) -> float:
 
 
 def wipe_event_embed(event: dict) -> discord.Embed:
-    votes = event.get("votes", {})
-    participants = event.get("participants", [])
-    counts = {key: sum(1 for vote in votes.values() if vote.get("status") == key)
-              for key in WIPE_RSVP_LABELS}
-    unanswered = max(0, len(participants) - len(votes))
     started = event.get("status") == "started" or event["start"] <= time.time()
     embed = discord.Embed(
         title=event["name"],
@@ -1129,10 +1149,16 @@ def wipe_event_embed(event: dict) -> discord.Embed:
         value=f"<t:{int(event['start'])}:F>\n<t:{int(event['start'])}:R>",
         inline=False,
     )
-    embed.add_field(name="✅ Иду", value=str(counts["yes"]), inline=True)
-    embed.add_field(name="❌ Отсутствую", value=str(counts["no"]), inline=True)
-    embed.add_field(name="❓ Опоздаю", value=str(counts["late"]), inline=True)
-    embed.add_field(name="Не ответили", value=str(unanswered), inline=True)
+    groups = (
+        ("✅ Иду", wipe_event_status_ids(event, "yes")),
+        ("❌ Отсутствую", wipe_event_status_ids(event, "no")),
+        ("❓ Опоздаю", wipe_event_status_ids(event, "late")),
+        ("⚠️ Не ответили", wipe_event_pending_ids(event)),
+    )
+    for title, user_ids in groups:
+        for index, mentions in enumerate(wipe_event_mention_chunks(user_ids)):
+            field_name = title if index == 0 else f"{title} · продолжение"
+            embed.add_field(name=field_name, value=mentions, inline=False)
     embed.set_footer(text="Сбор уже начался" if started else "Ответ можно изменить до начала сбора")
     return embed
 
@@ -1250,13 +1276,6 @@ async def send_wipe_event_dm(member: discord.Member, event: dict, jump_url: str,
         return False
 
 
-def wipe_event_member_name(guild: discord.Guild, user_id: int) -> str:
-    member = guild.get_member(user_id)
-    if member is None:
-        return f"Discord ID {user_id}"
-    return discord.utils.escape_markdown(member.display_name)
-
-
 def wipe_event_pending_ids(event: dict) -> list[int]:
     voted = {str(user_id) for user_id in event.get("votes", {})}
     return [int(user_id) for user_id in event.get("participants", []) if str(user_id) not in voted]
@@ -1267,22 +1286,22 @@ async def send_wipe_event_final(client: discord.Client, event: dict) -> None:
     channel = client.get_channel(int(event["channel_id"]))
     if guild is None or channel is None:
         return
-    votes = event.get("votes", {})
-    counts = {key: sum(1 for vote in votes.values() if vote.get("status") == key)
-              for key in WIPE_RSVP_LABELS}
     pending_ids = wipe_event_pending_ids(event)
     lines = [
         f"**Итоги подтверждения · {discord.utils.escape_markdown(event['name'])}**",
-        f"✅ Идут: **{counts['yes']}**",
-        f"❌ Отсутствуют: **{counts['no']}**",
-        f"❓ Опоздают: **{counts['late']}**",
-        f"⚠️ Не проголосовали: **{len(pending_ids)}**",
-        "",
-        "**Не проголосовали:**",
     ]
-    lines.extend((f"• {wipe_event_member_name(guild, user_id)}" for user_id in pending_ids))
-    if not pending_ids:
-        lines.append("• Все участники ответили.")
+    groups = (
+        ("✅ Идут", wipe_event_status_ids(event, "yes")),
+        ("❌ Отсутствуют", wipe_event_status_ids(event, "no")),
+        ("❓ Опоздают", wipe_event_status_ids(event, "late")),
+        ("⚠️ Не проголосовали", pending_ids),
+    )
+    for title, user_ids in groups:
+        lines.extend(("", f"**{title}:**"))
+        if user_ids:
+            lines.extend((f"• <@{user_id}> — `{user_id}`" for user_id in user_ids))
+        else:
+            lines.append("• Никого")
     for chunk in chunk_lines(lines):
         await channel.send(chunk, allowed_mentions=NO_PINGS)
 
@@ -2737,10 +2756,9 @@ async def wipe_pending(interaction: discord.Interaction, event: str | None = Non
     lines = [
         f"**Не проголосовали · {discord.utils.escape_markdown(selected['name'])}**",
         f"Сбор: <t:{int(selected['start'])}:F>",
-        f"Всего: **{len(pending_ids)}**",
         "",
     ]
-    lines.extend((f"• {wipe_event_member_name(interaction.guild, user_id)}"
+    lines.extend((f"• <@{user_id}> — `{user_id}`"
                   for user_id in pending_ids))
     if not pending_ids:
         lines.append("Все участники уже ответили.")
