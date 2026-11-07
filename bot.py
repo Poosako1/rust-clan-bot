@@ -3097,6 +3097,66 @@ async def ticket_sync_panel(interaction: discord.Interaction):
         "Панель выложена. Отчёты будут приходить тебе в личку.", ephemeral=True)
 
 
+@bot.tree.command(name="main_dm", description="Разослать сообщение участникам Мейн-приватки")
+@app_commands.default_permissions(administrator=True)
+async def main_dm(interaction: discord.Interaction):
+    main_guild_id = cfg_id(ticket_sync_source_guild_key("main"))
+    main_guild = interaction.client.get_guild(main_guild_id) if main_guild_id else None
+    if main_guild is None:
+        await interaction.response.send_message(
+            "Мейн-приватка не настроена. Сначала запусти в ней `/ticket_roles team:Мейн`.",
+            ephemeral=True,
+        )
+        return
+    if interaction.guild is None or interaction.guild.id != main_guild.id:
+        await interaction.response.send_message(
+            f"Команду нужно запускать в настроенной Мейн-приватке «{main_guild.name}».",
+            ephemeral=True,
+        )
+        return
+
+    requester = main_guild.get_member(interaction.user.id)
+    requester_perms = getattr(requester, "guild_permissions", None)
+    if requester is None or requester_perms is None or not requester_perms.administrator:
+        await interaction.response.send_message("Нужно право «Администратор».", ephemeral=True)
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Бот не видит список участников. Включи Server Members Intent в Discord Developer Portal.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        members = await fetch_all_members(main_guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не получилось получить участников приватки: {short_error(e)}",
+            ephemeral=True,
+        )
+        return
+
+    sent = 0
+    failed = []
+    for member in members.values():
+        try:
+            await member.send("Заходи в сеть, тварь!", allowed_mentions=NO_PINGS)
+            sent += 1
+        except Exception:
+            failed.append(f"{member} ({member.id})")
+        await asyncio.sleep(0.15)
+
+    result = f"Готово. Отправлено: {sent}. Не доставлено: {len(failed)}."
+    if failed:
+        result += "\nЛичка закрыта или сообщение недоступно:\n" + "\n".join(
+            f"• {name}" for name in failed[:30]
+        )
+        if len(failed) > 30:
+            result += f"\n…и ещё {len(failed) - 30}."
+    await interaction.followup.send(result[:1900], ephemeral=True)
+
+
 async def send_who_plays(interaction: discord.Interaction):
     """Список: кто сейчас должен играть (ответ в канал)."""
     await interaction.response.defer()
