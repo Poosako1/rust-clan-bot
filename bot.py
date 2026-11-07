@@ -41,6 +41,9 @@ DATA_FILE = BASE / "data.json"
 KEEP_DAYS = 45
 TZ = dt.timezone(dt.timedelta(hours=TZ_OFFSET_HOURS))
 NO_PINGS = discord.AllowedMentions.none()
+MAIN_VOICE_TZ = dt.timezone(dt.timedelta(hours=3))
+MAIN_VOICE_REPORT_HOUR = 14
+MAIN_VOICE_NORM_HOURS = 8.0
 STAFF_ROLE_ID = int(os.environ.get("STAFF_ROLE_ID", "0") or 0)  # роль стаффа, её упоминают в тикете (необязательно)
 
 # ---------- даты ----------
@@ -86,6 +89,10 @@ class Store:
         self.ticket_counters: dict[str, int] = {}  # guild_id:тип -> последний номер тикета
         self.private_invites: dict[str, dict] = {}  # discord id -> ожидаемая приватка и роль после принятия
         self.wipe_events: dict[str, dict] = {}  # id -> сбор с голосами ✅/❌/❓
+        self.main_voice_window_start: float = 0.0
+        self.main_voice_seconds: dict[str, float] = {}
+        self.main_voice_active: dict[str, float] = {}
+        self.main_voice_pending: dict = {}
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -99,6 +106,14 @@ class Store:
             self.ticket_counters = d.get("ticket_counters", {})
             self.private_invites = d.get("private_invites", {})
             self.wipe_events = d.get("wipe_events", {})
+            self.main_voice_window_start = float(d.get("main_voice_window_start", 0) or 0)
+            self.main_voice_seconds = {
+                str(k): float(v) for k, v in d.get("main_voice_seconds", {}).items()
+            }
+            self.main_voice_active = {
+                str(k): float(v) for k, v in d.get("main_voice_active", {}).items()
+            }
+            self.main_voice_pending = d.get("main_voice_pending", {}) or {}
 
     def save(self):
         self.heartbeat = time.time()
@@ -119,7 +134,11 @@ class Store:
                                    "drafts": self.drafts, "cfg": self.cfg,
                                    "ticket_counters": self.ticket_counters,
                                    "private_invites": self.private_invites,
-                                   "wipe_events": self.wipe_events}), encoding="utf-8")
+                                   "wipe_events": self.wipe_events,
+                                   "main_voice_window_start": self.main_voice_window_start,
+                                   "main_voice_seconds": self.main_voice_seconds,
+                                   "main_voice_active": self.main_voice_active,
+                                   "main_voice_pending": self.main_voice_pending}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -141,6 +160,19 @@ class Store:
         if start is not None:
             self.voice.append([uid, start, time.time()])
         self.save()
+
+    def main_voice_start(self, uid: str, now: float | None = None):
+        current = now or time.time()
+        if self.main_voice_window_start and current >= self.main_voice_window_start:
+            self.main_voice_active.setdefault(uid, current)
+            self.save()
+
+    def main_voice_stop(self, uid: str, now: float | None = None):
+        current = now or time.time()
+        started = self.main_voice_active.pop(uid, None)
+        if started is not None:
+            self.main_voice_seconds[uid] = self.main_voice_seconds.get(uid, 0.0) + max(0.0, current - started)
+            self.save()
 
     def spans(self, uid: str, now: float) -> list[tuple[float, float]]:
         out = [(s, e) for u, s, e in self.voice if u == uid]
@@ -2460,6 +2492,150 @@ class TicketRoleSyncView(discord.ui.View):
         await interaction.edit_original_response(content=f"Готово. Отчёт отправлен тебе в личку. {summary}")
 
 
+def main_voice_owner_id() -> int:
+    return cfg_id("main_voice_report_owner") or cfg_id("ticket_sync_report_owner")
+
+
+def main_voice_latest_boundary(timestamp: float) -> float:
+    local_now = dt.datetime.fromtimestamp(timestamp, MAIN_VOICE_TZ)
+    boundary = local_now.replace(hour=MAIN_VOICE_REPORT_HOUR, minute=0, second=0, microsecond=0)
+    if local_now < boundary:
+        boundary -= dt.timedelta(days=1)
+    return boundary.timestamp()
+
+
+def main_voice_next_boundary(timestamp: float) -> float:
+    latest = main_voice_latest_boundary(timestamp)
+    if timestamp - latest < 60:
+        return latest
+    return latest + 86400
+
+
+def main_voice_guild(client: discord.Client) -> discord.Guild | None:
+    guild_id = cfg_id(ticket_sync_source_guild_key("main"))
+    return client.get_guild(guild_id) if guild_id else None
+
+
+def current_main_voice_members(guild: discord.Guild) -> dict[str, discord.Member]:
+    return {
+        str(member.id): member
+        for channel in guild.voice_channels
+        for member in channel.members
+        if not member.bot
+    }
+
+
+async def send_pending_main_voice_report(client: discord.Client):
+    pending = store.main_voice_pending
+    if not pending:
+        return
+    owner_id = int(pending.get("owner_id") or 0)
+    chunks = list(pending.get("chunks") or [])
+    next_chunk = int(pending.get("next_chunk") or 0)
+    if not owner_id or next_chunk >= len(chunks):
+        store.main_voice_pending = {}
+        store.save()
+        return
+    owner = client.get_user(owner_id)
+    if owner is None:
+        owner = await client.fetch_user(owner_id)
+    while next_chunk < len(chunks):
+        await owner.send(chunks[next_chunk], allowed_mentions=NO_PINGS)
+        next_chunk += 1
+        store.main_voice_pending["next_chunk"] = next_chunk
+        store.save()
+    store.main_voice_pending = {}
+    store.save()
+
+
+async def build_main_voice_report(guild: discord.Guild, totals: dict[str, float],
+                                  window_start: float, window_end: float) -> list[str]:
+    members = await fetch_all_members(guild)
+    rows = [(member, totals.get(str(member.id), 0.0) / 3600) for member in members.values()]
+    missed = sorted((row for row in rows if row[1] < MAIN_VOICE_NORM_HOURS), key=lambda row: row[1])
+    completed = sorted((row for row in rows if row[1] >= MAIN_VOICE_NORM_HOURS),
+                       key=lambda row: row[1], reverse=True)
+    start_text = dt.datetime.fromtimestamp(window_start, MAIN_VOICE_TZ).strftime("%d.%m %H:%M")
+    end_text = dt.datetime.fromtimestamp(window_end, MAIN_VOICE_TZ).strftime("%d.%m %H:%M")
+    lines = [
+        f"**Отчёт Мейн-приватки · {start_text} — {end_text} МСК**",
+        f"Норма: **{MAIN_VOICE_NORM_HOURS:g} часов в сутки**",
+        f"Выполнили: **{len(completed)}/{len(rows)}**",
+        "",
+        f"**❌ Не выполнили — {len(missed)}**",
+    ]
+    lines.extend(
+        f"• {member.mention} (`{member.id}`) — **{hours:.1f} ч**"
+        for member, hours in missed
+    )
+    lines.extend(["", f"**✅ Выполнили — {len(completed)}**"])
+    lines.extend(
+        f"• {member.mention} (`{member.id}`) — **{hours:.1f} ч**"
+        for member, hours in completed
+    )
+    return chunk_lines(lines)
+
+
+async def process_main_voice_tracking(client: discord.Client):
+    owner_id = main_voice_owner_id()
+    guild = main_voice_guild(client)
+    if not owner_id or guild is None or not MEMBERS_OK:
+        return
+
+    now = time.time()
+    if store.main_voice_window_start <= 0:
+        store.main_voice_window_start = main_voice_next_boundary(now)
+        store.main_voice_seconds = {}
+        store.main_voice_active = {}
+        store.save()
+
+    if store.main_voice_pending:
+        await send_pending_main_voice_report(client)
+
+    window_start = store.main_voice_window_start
+    if now < window_start:
+        return
+
+    voice_members = current_main_voice_members(guild)
+    window_end = window_start + 86400
+    if now >= window_end:
+        totals = dict(store.main_voice_seconds)
+        for uid, started in store.main_voice_active.items():
+            totals[uid] = totals.get(uid, 0.0) + max(0.0, window_end - max(started, window_start))
+
+        chunks = await build_main_voice_report(guild, totals, window_start, window_end)
+        new_start = main_voice_latest_boundary(now)
+        store.main_voice_window_start = new_start
+        store.main_voice_seconds = {}
+        store.main_voice_active = {
+            uid: max(now, new_start) for uid in voice_members
+        }
+        store.main_voice_pending = {
+            "owner_id": owner_id,
+            "chunks": chunks,
+            "next_chunk": 0,
+        }
+        store.save()
+        await send_pending_main_voice_report(client)
+        return
+
+    changed = False
+    cutoff = min(now, max(window_start, store.heartbeat))
+    for uid, started in list(store.main_voice_active.items()):
+        if uid not in voice_members:
+            store.main_voice_seconds[uid] = (
+                store.main_voice_seconds.get(uid, 0.0) + max(0.0, cutoff - started)
+            )
+            del store.main_voice_active[uid]
+            changed = True
+    for uid in voice_members:
+        if uid not in store.main_voice_active:
+            store.main_voice_active[uid] = now
+            changed = True
+    if changed:
+        store.save()
+
+
 # ---------- бот ----------
 class Bot(discord.Client):
     def __init__(self):
@@ -2497,6 +2673,10 @@ class Bot(discord.Client):
                     sync_ok = False
                     print(f"Не удалось синхронизировать команды на сервере {guild.id}: {short_error(e)}", flush=True)
             self.guild_commands_synced = sync_ok
+        try:
+            await process_main_voice_tracking(self)
+        except Exception as e:
+            print(f"Ошибка учёта войса Мейн-приватки при запуске: {short_error(e)}", flush=True)
         in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
         store.reconcile(in_voice)
         try:
@@ -2579,6 +2759,13 @@ class Bot(discord.Client):
         elif before.channel is not None and after.channel is None:
             store.voice_stop(uid)
 
+        main_guild_id = cfg_id(ticket_sync_source_guild_key("main"))
+        if main_guild_id and member.guild.id == main_guild_id:
+            if before.channel is None and after.channel is not None:
+                store.main_voice_start(uid)
+            elif before.channel is not None and after.channel is None:
+                store.main_voice_stop(uid)
+
     async def on_message(self, message):
         if not use_editor() or message.author.bot or message.channel.id != editor_channel_id():
             return
@@ -2611,6 +2798,10 @@ class Bot(discord.Client):
             await process_wipe_event_reminders(self)
         except Exception as e:
             print(f"Ошибка напоминаний о сборах: {short_error(e)}", flush=True)
+        try:
+            await process_main_voice_tracking(self)
+        except Exception as e:
+            print(f"Ошибка ежедневного отчёта войса Мейн-приватки: {short_error(e)}", flush=True)
 
     @wipe_tick.before_loop
     async def _wait(self):
@@ -3095,6 +3286,48 @@ async def ticket_sync_panel(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=TicketRoleSyncView())
     await interaction.response.send_message(
         "Панель выложена. Отчёты будут приходить тебе в личку.", ephemeral=True)
+
+
+@bot.tree.command(name="main_voice_report", description="Назначить себе ежедневный отчёт войса Мейн-приватки")
+@app_commands.default_permissions(administrator=True)
+async def main_voice_report(interaction: discord.Interaction):
+    main_guild = main_voice_guild(interaction.client)
+    if main_guild is None:
+        await interaction.response.send_message(
+            "Мейн-приватка не настроена. Сначала запусти в ней `/ticket_roles team:Мейн`.",
+            ephemeral=True,
+        )
+        return
+    if interaction.guild is None or interaction.guild.id != main_guild.id:
+        await interaction.response.send_message(
+            f"Команду нужно запускать в Мейн-приватке «{main_guild.name}».",
+            ephemeral=True,
+        )
+        return
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not perms.administrator:
+        await interaction.response.send_message("Нужно право «Администратор».", ephemeral=True)
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Включи Server Members Intent в Discord Developer Portal.", ephemeral=True
+        )
+        return
+
+    store.cfg["main_voice_report_owner"] = interaction.user.id
+    if store.main_voice_window_start <= 0:
+        store.main_voice_window_start = main_voice_next_boundary(time.time())
+        store.main_voice_seconds = {}
+        store.main_voice_active = {}
+    store.save()
+    start_text = dt.datetime.fromtimestamp(
+        store.main_voice_window_start, MAIN_VOICE_TZ
+    ).strftime("%d.%m.%Y в %H:%M")
+    await interaction.response.send_message(
+        f"Готово. Учёт начнётся {start_text} МСК. "
+        f"Каждые сутки в 14:00 я пришлю тебе личный отчёт. Норма — {MAIN_VOICE_NORM_HOURS:g} часов.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="main_dm", description="Разослать сообщение участникам Мейн-приватки")
