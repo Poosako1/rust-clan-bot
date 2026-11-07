@@ -10,6 +10,7 @@ readonly RESULT_FILE="/root/happ-vpn.txt"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly VPN_PORT="${VPN_PORT:-443}"
 readonly REALITY_HOST="${REALITY_HOST:-www.microsoft.com}"
+readonly ALLOW_REPLACE_XRAY="${ALLOW_REPLACE_XRAY:-0}"
 
 fail() {
   echo "ОШИБКА: $*" >&2
@@ -41,7 +42,12 @@ if ss -H -ltn "sport = :${VPN_PORT}" 2>/dev/null | grep -q .; then
 fi
 
 if [ -s "${XRAY_CONFIG}" ]; then
-  fail "Xray уже настроен (${XRAY_CONFIG}). Скрипт остановлен, чтобы не затереть существующий VPN"
+  if [ "${ALLOW_REPLACE_XRAY}" != "1" ]; then
+    fail "Xray уже установлен. Для продолжения после прерванной первой установки запусти: sudo ALLOW_REPLACE_XRAY=1 bash $0"
+  fi
+  backup_config="${XRAY_CONFIG}.backup-$(date +%Y%m%d-%H%M%S)"
+  cp -a "${XRAY_CONFIG}" "${backup_config}"
+  echo "Существующая конфигурация сохранена: ${backup_config}"
 fi
 
 echo "[2/7] Загружаю официальный установщик Xray..."
@@ -58,7 +64,7 @@ echo "[4/7] Создаю персональные ключи..."
 client_id="$(xray uuid)"
 key_output="$(xray x25519)"
 private_key="$(printf '%s\n' "${key_output}" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')"
-public_key="$(printf '%s\n' "${key_output}" | awk -F': *' 'tolower($1) ~ /^(public ?key|password)$/ {print $2; exit}')"
+public_key="$(printf '%s\n' "${key_output}" | awk -F': *' 'tolower($1) ~ /^(public ?key|password)/ {print $2; exit}')"
 short_id="$(openssl rand -hex 8)"
 
 [ -n "${client_id}" ] || fail "не удалось создать UUID"
