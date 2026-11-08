@@ -216,11 +216,34 @@ def staff_role_id() -> int:
     return cfg_id("staff", STAFF_ROLE_ID)
 
 
-def ticket_access_role_ids() -> list[int]:
+def ticket_access_role_ids(kind: str | None = None) -> list[int]:
+    """Роли доступа отдельно для Мейн, Секонд и поддержки.
+
+    Пока новые настройки не сохранены, используются старые общие роли,
+    чтобы обновление само по себе не закрыло доступ к уже работающим тикетам.
+    """
+    keys = {
+        "main": "ticket_access_main_role",
+        "second": "ticket_access_second_role",
+        "support": "ticket_access_support_role",
+    }
+    separated = any(cfg_id(key) for key in keys.values())
+    if separated:
+        if kind in keys:
+            role_id = cfg_id(keys[kind])
+            return [role_id] if role_id else []
+        return list(dict.fromkeys(
+            role_id for role_id in (cfg_id(key) for key in keys.values()) if role_id
+        ))
     return list(dict.fromkeys(role_id for role_id in (
         cfg_id("ticket_access_role"),
         cfg_id("ticket_access_role_2"),
     ) if role_id))
+
+
+def ticket_kind_from_topic(topic: str) -> str | None:
+    match = re.match(r"^ticket:(main|second|support)(?:\s|$)", topic or "")
+    return match.group(1) if match else None
 
 
 def use_editor() -> bool:
@@ -1715,8 +1738,8 @@ def ticket_role_option(role: str, kind: str) -> discord.SelectOption:
     return discord.SelectOption(label=ticket_role_label(role), value=role, description=description)
 
 
-def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
-    """Доступ к тикету: автор, бот, настроенный стафф и административные роли."""
+def ticket_overwrites(guild: discord.Guild, opener: discord.Member, kind: str) -> dict:
+    """Доступ: автор, бот, роль нужного типа тикета и административные роли."""
     P = discord.PermissionOverwrite
     access = P(view_channel=True, send_messages=True, read_message_history=True, attach_files=True,
                embed_links=True)
@@ -1725,10 +1748,7 @@ def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
         overwrites[guild.me] = P(view_channel=True, send_messages=True, read_message_history=True,
                                  attach_files=True, embed_links=True, manage_channels=True,
                                  manage_messages=True)
-    configured_staff = guild.get_role(staff_role_id())
-    if configured_staff is not None:
-        overwrites[configured_staff] = access
-    for role_id in ticket_access_role_ids():
+    for role_id in ticket_access_role_ids(kind):
         ticket_access = guild.get_role(role_id)
         if ticket_access is not None:
             overwrites[ticket_access] = access
@@ -1740,27 +1760,35 @@ def ticket_overwrites(guild: discord.Guild, opener: discord.Member) -> dict:
     return overwrites
 
 
-async def apply_ticket_access_roles(guild: discord.Guild, old_role_ids: list[int],
-                                    roles: list[discord.Role]) -> int:
-    """Обновить доступ ролей во всех уже открытых тикетах."""
+async def apply_ticket_access_roles(
+    guild: discord.Guild,
+    old_role_ids: list[int],
+    roles_by_kind: dict[str, list[discord.Role]],
+) -> int:
+    """Разделить доступ ролей во всех уже открытых тикетах по их типу."""
     access = discord.PermissionOverwrite(
         view_channel=True, send_messages=True, read_message_history=True,
         attach_files=True, embed_links=True,
     )
-    new_role_ids = {role.id for role in roles}
-    old_roles = [guild.get_role(role_id) for role_id in old_role_ids
-                 if role_id not in new_role_ids and role_id != staff_role_id()]
+    all_role_ids = set(old_role_ids)
+    for roles in roles_by_kind.values():
+        all_role_ids.update(role.id for role in roles)
+
     updated = 0
     for channel in guild.text_channels:
-        if not (channel.topic or "").startswith("ticket:"):
+        kind = ticket_kind_from_topic(channel.topic or "")
+        if kind is None:
             continue
-        for old_role in old_roles:
-            if old_role is not None:
-                await channel.set_permissions(old_role, overwrite=None,
-                                              reason="Изменены роли доступа к тикетам")
-        for role in roles:
-            await channel.set_permissions(role, overwrite=access,
-                                          reason="Настроена роль доступа к тикетам")
+        desired_roles = roles_by_kind.get(kind, [])
+        desired_ids = {role.id for role in desired_roles}
+        for role_id in all_role_ids:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            overwrite = access if role_id in desired_ids else None
+            await channel.set_permissions(
+                role, overwrite=overwrite, reason="Разделены роли доступа к тикетам"
+            )
         updated += 1
     return updated
 
@@ -1808,7 +1836,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
             channel = await guild.create_text_channel(
                 name,
                 category=getattr(interaction.channel, "category", None),
-                overwrites=ticket_overwrites(guild, interaction.user),
+                overwrites=ticket_overwrites(guild, interaction.user, kind),
                 topic=(f"ticket:{kind} owner:{interaction.user.id} "
                        f"role:{TICKET_ROLE_SLUGS.get(selected_role or '', 'general')}"),
                 reason=f"{settings['title']}: {interaction.user}",
@@ -1817,7 +1845,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, selected_ro
             store.ticket_counters[counter_key] = number
             store.save()
         notify_roles = []
-        for role_id in (staff_role_id(), *ticket_access_role_ids()):
+        for role_id in ticket_access_role_ids(kind):
             role = guild.get_role(role_id)
             if role is not None and role.id not in {item.id for item in notify_roles}:
                 notify_roles.append(role)
@@ -1883,7 +1911,8 @@ def can_close_ticket(interaction: discord.Interaction) -> bool:
     perms = getattr(interaction.user, "guild_permissions", None)
     if perms and perms.administrator:
         return True
-    access_role_ids = set(ticket_access_role_ids())
+    kind = ticket_kind_from_topic(topic)
+    access_role_ids = set(ticket_access_role_ids(kind))
     return any(role.id in access_role_ids for role in getattr(interaction.user, "roles", []))
 
 
@@ -3223,47 +3252,86 @@ async def ticket_roles(interaction: discord.Interaction, team: str | None = None
     await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_PINGS)
 
 
-@bot.tree.command(name="ticket_access", description="Настроить две роли доступа ко всем тикетам")
+@bot.tree.command(name="ticket_access", description="Разделить роли доступа к Мейн и Секонд тикетам")
 @app_commands.describe(
-    role_1="Первая роль из этого сервера, например Тикет стафф",
-    role_2="Вторая роль из этого сервера",
+    main_role="Роль, которая видит и закрывает только Мейн-тикеты",
+    second_role="Роль, которая видит и закрывает только Секонд-тикеты",
+    support_role="Необязательно: отдельная роль для тикетов поддержки",
 )
 @app_commands.default_permissions(administrator=True)
-async def ticket_access(interaction: discord.Interaction, role_1: discord.Role,
-                        role_2: discord.Role | None = None):
+async def ticket_access(
+    interaction: discord.Interaction,
+    main_role: discord.Role,
+    second_role: discord.Role,
+    support_role: discord.Role | None = None,
+):
     if not await admin_only(interaction):
         return
     if interaction.guild is None:
         await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
         return
-    roles = list(dict.fromkeys(role for role in (role_1, role_2) if role is not None))
+    roles = [role for role in (main_role, second_role, support_role) if role is not None]
     if any(role.is_default() for role in roles):
         await interaction.response.send_message("Роль @everyone использовать нельзя.", ephemeral=True)
         return
+    if main_role.id == second_role.id:
+        await interaction.response.send_message(
+            "Для Мейн и Секонд нужно выбрать разные роли.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
-    old_role_ids = ticket_access_role_ids()
-    store.cfg["ticket_access_role"] = role_1.id
-    if role_2 is None:
-        store.cfg.pop("ticket_access_role_2", None)
+    old_role_ids = list(dict.fromkeys((
+        staff_role_id(),
+        *ticket_access_role_ids(),
+        cfg_id("ticket_access_main_role"),
+        cfg_id("ticket_access_second_role"),
+        cfg_id("ticket_access_support_role"),
+    )))
+    store.cfg["ticket_access_main_role"] = main_role.id
+    store.cfg["ticket_access_second_role"] = second_role.id
+    if support_role is None:
+        store.cfg.pop("ticket_access_support_role", None)
     else:
-        store.cfg["ticket_access_role_2"] = role_2.id
+        store.cfg["ticket_access_support_role"] = support_role.id
+    store.cfg.pop("ticket_access_role", None)
+    store.cfg.pop("ticket_access_role_2", None)
     store.save()
+
+    roles_by_kind = {
+        "main": [main_role],
+        "second": [second_role],
+        "support": [support_role] if support_role is not None else [],
+    }
     try:
-        updated = await apply_ticket_access_roles(interaction.guild, old_role_ids, roles)
+        updated = await apply_ticket_access_roles(
+            interaction.guild, old_role_ids, roles_by_kind
+        )
     except discord.Forbidden:
         await interaction.followup.send(
-            "Роли сохранены, но не удалось обновить открытые тикеты: боту нужно право «Управлять каналами».",
-            ephemeral=True)
+            "Роли сохранены, но не удалось обновить открытые тикеты: "
+            "боту нужно право «Управлять каналами».",
+            ephemeral=True,
+        )
         return
     except Exception as e:
         await interaction.followup.send(
-            f"Роли сохранены, но не удалось обновить открытые тикеты: {short_error(e)}", ephemeral=True)
+            f"Роли сохранены, но не удалось обновить открытые тикеты: {short_error(e)}",
+            ephemeral=True,
+        )
         return
-    mentions = " и ".join(role.mention for role in roles)
+
+    support_text = (
+        f" Поддержка: {support_role.mention}."
+        if support_role is not None else
+        " Тикеты поддержки доступны только администраторам."
+    )
     await interaction.followup.send(
-        f"Готово. {mentions} теперь видят, отвечают и закрывают все тикеты. "
-        f"Обновлено открытых тикетов: {updated}.",
-        ephemeral=True, allowed_mentions=NO_PINGS)
+        f"Готово. Мейн: {main_role.mention}. Секонд: {second_role.mention}."
+        f"{support_text} Обновлено открытых тикетов: {updated}.",
+        ephemeral=True,
+        allowed_mentions=NO_PINGS,
+    )
 
 
 @bot.tree.command(name="ticket_sync_panel", description="Выложить панель синхронизации ролей составов")
