@@ -73,7 +73,7 @@ short_id="$(openssl rand -hex 8)"
 
 echo "[5/7] Записываю конфигурацию..."
 install -d -m 755 "$(dirname "${XRAY_CONFIG}")"
-candidate_config="$(mktemp)"
+candidate_config="$(mktemp --suffix=.json)"
 cat >"${candidate_config}" <<JSON
 {
   "log": {
