@@ -127,7 +127,7 @@ cat >"${candidate_config}" <<JSON
 JSON
 
 xray run -test -config "${candidate_config}"
-install -m 600 "${candidate_config}" "${XRAY_CONFIG}"
+install -o xray -g xray -m 600 "${candidate_config}" "${XRAY_CONFIG}"
 
 echo "[6/7] Открываю порт и запускаю службу..."
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
