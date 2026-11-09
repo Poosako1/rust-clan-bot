@@ -3391,6 +3391,73 @@ async def main_voice_report(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="mss", description="Отправить личное сообщение всем участникам сервера")
+@app_commands.describe(text="Текст личного сообщения")
+@app_commands.default_permissions(administrator=True)
+async def mss(interaction: discord.Interaction, text: str):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Команда работает только на сервере.", ephemeral=True
+        )
+        return
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not perms.administrator:
+        await interaction.response.send_message(
+            "Нужно право «Администратор».", ephemeral=True
+        )
+        return
+    message_text = text.strip()
+    if not message_text:
+        await interaction.response.send_message(
+            "Текст сообщения не может быть пустым.", ephemeral=True
+        )
+        return
+    if len(message_text) > 1900:
+        await interaction.response.send_message(
+            "Сообщение слишком длинное. Максимум — 1900 символов.", ephemeral=True
+        )
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Бот не видит список участников. Включи Server Members Intent "
+            "в Discord Developer Portal.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        members = await fetch_all_members(interaction.guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось получить список участников: {short_error(e)}",
+            ephemeral=True,
+        )
+        return
+
+    sent = 0
+    failed = []
+    for member in members.values():
+        try:
+            await member.send(message_text, allowed_mentions=NO_PINGS)
+            sent += 1
+        except Exception:
+            failed.append(f"{member} ({member.id})")
+        await asyncio.sleep(0.15)
+
+    result = (
+        f"Рассылка завершена. Участников: {len(members)}. "
+        f"Доставлено: {sent}. Не доставлено: {len(failed)}."
+    )
+    if failed:
+        result += "\nНе удалось отправить:\n" + "\n".join(
+            f"• {name}" for name in failed[:30]
+        )
+        if len(failed) > 30:
+            result += f"\n…и ещё {len(failed) - 30}."
+    await interaction.followup.send(result[:1900], ephemeral=True)
+
+
 @bot.tree.command(name="main_dm", description="Разослать сообщение участникам Мейн-приватки")
 @app_commands.default_permissions(administrator=True)
 async def main_dm(interaction: discord.Interaction):
