@@ -1287,9 +1287,14 @@ async def record_wipe_event_vote(interaction: discord.Interaction, event_id: str
     if event.get("status") != "open" or event["start"] <= time.time():
         await interaction.response.send_message("Голосование уже закрыто.", ephemeral=True)
         return
-    if str(interaction.user.id) not in {str(uid) for uid in event.get("participants", [])}:
-        await interaction.response.send_message("Ты не входишь в список участников этого сбора.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or interaction.user.bot:
+        await interaction.response.send_message(
+            "Голосовать могут только участники сервера.", ephemeral=True
+        )
         return
+    participant_ids = {str(uid) for uid in event.get("participants", [])}
+    if str(interaction.user.id) not in participant_ids:
+        event.setdefault("participants", []).append(interaction.user.id)
     event.setdefault("votes", {})[str(interaction.user.id)] = {
         "status": status,
         "reason": reason.strip(),
