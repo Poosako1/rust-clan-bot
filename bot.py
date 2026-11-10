@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 import io
 import json
 import time
@@ -3968,6 +3969,155 @@ async def report(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await post_report(interaction.channel)
     await interaction.followup.send("Сводка выложена.", ephemeral=True)
+
+
+
+@bot.tree.command(name="randomizer", description="Разыграть приз среди участников приватки")
+@app_commands.describe(
+    prize="Что разыгрываем",
+    winners="Количество победителей: от 1 до 20",
+    pool="Участники всего сервера или только текущего войса",
+    exclude_role_1="Первая роль, которая не участвует",
+    exclude_role_2="Вторая роль, которая не участвует",
+    exclude_role_3="Третья роль, которая не участвует",
+    exclude_role_4="Четвёртая роль, которая не участвует",
+    exclude_role_5="Пятая роль, которая не участвует",
+)
+@app_commands.choices(pool=[
+    app_commands.Choice(name="Весь сервер", value="server"),
+    app_commands.Choice(name="Текущий голосовой канал", value="voice"),
+])
+@app_commands.default_permissions(administrator=True)
+async def randomizer(
+    interaction: discord.Interaction,
+    prize: str,
+    winners: int = 1,
+    pool: str = "server",
+    exclude_role_1: discord.Role | None = None,
+    exclude_role_2: discord.Role | None = None,
+    exclude_role_3: discord.Role | None = None,
+    exclude_role_4: discord.Role | None = None,
+    exclude_role_5: discord.Role | None = None,
+):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Команда работает только на сервере.", ephemeral=True
+        )
+        return
+    if not 1 <= winners <= 20:
+        await interaction.response.send_message(
+            "Количество победителей должно быть от 1 до 20.", ephemeral=True
+        )
+        return
+    prize = prize.strip()
+    if not prize:
+        await interaction.response.send_message(
+            "Укажи, что разыгрываем.", ephemeral=True
+        )
+        return
+    if len(prize) > 300:
+        await interaction.response.send_message(
+            "Название приза должно быть не длиннее 300 символов.", ephemeral=True
+        )
+        return
+
+    excluded_roles = list(dict.fromkeys(
+        role for role in (
+            exclude_role_1, exclude_role_2, exclude_role_3,
+            exclude_role_4, exclude_role_5,
+        )
+        if role is not None
+    ))
+    if any(role.is_default() for role in excluded_roles):
+        await interaction.response.send_message(
+            "Роль @everyone исключать нельзя — тогда участников не останется.",
+            ephemeral=True,
+        )
+        return
+
+    if pool == "voice":
+        invoker = interaction.guild.get_member(interaction.user.id)
+        voice_channel = getattr(getattr(invoker, "voice", None), "channel", None)
+        if voice_channel is None:
+            await interaction.response.send_message(
+                "Сначала зайди в нужный голосовой канал.", ephemeral=True
+            )
+            return
+        source_members = list(voice_channel.members)
+        pool_name = f"войс «{voice_channel.name}»"
+    else:
+        if not MEMBERS_OK:
+            await interaction.response.send_message(
+                "Бот не видит полный список участников. Включи Server Members Intent "
+                "в Discord Developer Portal и перезапусти бота.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            source_members = [
+                member async for member in interaction.guild.fetch_members(limit=None)
+            ]
+        except discord.Forbidden:
+            await interaction.edit_original_response(
+                content="Бот не может получить список участников сервера."
+            )
+            return
+        except Exception as e:
+            await interaction.edit_original_response(
+                content=f"Не удалось получить участников: {short_error(e)}"
+            )
+            return
+        pool_name = "весь сервер"
+
+    excluded_role_ids = {role.id for role in excluded_roles}
+    eligible = [
+        member for member in source_members
+        if not member.bot
+        and not any(role.id in excluded_role_ids for role in member.roles)
+    ]
+
+    if len(eligible) < winners:
+        message = (
+            f"Недостаточно участников: подходит {len(eligible)}, "
+            f"а победителей указано {winners}."
+        )
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content=message)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    selected = secrets.SystemRandom().sample(eligible, winners)
+    winner_lines = [
+        f"**{index}.** {member.mention} — {member} ({member.id})"
+        for index, member in enumerate(selected, 1)
+    ]
+    excluded_text = (
+        ", ".join(role.mention for role in excluded_roles)
+        if excluded_roles else "нет"
+    )
+    embed = discord.Embed(
+        title="Результат розыгрыша",
+        description=f"**Приз:** {prize}",
+        colour=0xF1C40F,
+    )
+    embed.add_field(name="Участники", value=f"{pool_name} · допущено: **{len(eligible)}**", inline=False)
+    embed.add_field(name="Не участвуют роли", value=excluded_text, inline=False)
+    embed.add_field(name="Победители", value="\n".join(winner_lines), inline=False)
+    embed.set_footer(text=f"Запустил: {interaction.user} · случайный выбор без повторов")
+
+    allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    if interaction.response.is_done():
+        await interaction.edit_original_response(
+            content=None, embed=embed, allowed_mentions=allowed
+        )
+    else:
+        await interaction.response.send_message(
+            embed=embed, allowed_mentions=allowed
+        )
 
 
 bot.run(DISCORD_TOKEN)
