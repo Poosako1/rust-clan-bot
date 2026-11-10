@@ -4090,34 +4090,86 @@ async def randomizer(
             await interaction.response.send_message(message, ephemeral=True)
         return
 
-    selected = secrets.SystemRandom().sample(eligible, winners)
-    winner_lines = [
-        f"**{index}.** {member.mention} — {member} ({member.id})"
-        for index, member in enumerate(selected, 1)
-    ]
     excluded_text = (
         ", ".join(role.mention for role in excluded_roles)
         if excluded_roles else "нет"
     )
-    embed = discord.Embed(
-        title="Результат розыгрыша",
-        description=f"**Приз:** {prize}",
-        colour=0xF1C40F,
+    finish_at = int(time.time()) + 120
+    start_embed = discord.Embed(
+        title="Розыгрыш начался",
+        description=(
+            f"**Приз:** {prize}\n\n"
+            f"Победители будут выбраны <t:{finish_at}:R>."
+        ),
+        colour=0x5865F2,
     )
-    embed.add_field(name="Участники", value=f"{pool_name} · допущено: **{len(eligible)}**", inline=False)
-    embed.add_field(name="Не участвуют роли", value=excluded_text, inline=False)
-    embed.add_field(name="Победители", value="\n".join(winner_lines), inline=False)
-    embed.set_footer(text=f"Запустил: {interaction.user} · случайный выбор без повторов")
+    start_embed.add_field(
+        name="Участники",
+        value=f"{pool_name} · допущено: **{len(eligible)}**",
+        inline=False,
+    )
+    start_embed.add_field(
+        name="Не участвуют роли",
+        value=excluded_text,
+        inline=False,
+    )
+    start_embed.set_footer(text="Таймер: 2 минуты")
 
-    allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    no_mentions = discord.AllowedMentions.none()
     if interaction.response.is_done():
         await interaction.edit_original_response(
-            content=None, embed=embed, allowed_mentions=allowed
+            content=None, embed=start_embed, allowed_mentions=no_mentions
         )
     else:
         await interaction.response.send_message(
-            embed=embed, allowed_mentions=allowed
+            embed=start_embed, allowed_mentions=no_mentions
         )
+
+    await asyncio.sleep(110)
+    for seconds_left in range(10, 0, -1):
+        countdown_embed = discord.Embed(
+            title="Розыгрыш",
+            description=(
+                f"**Приз:** {prize}\n\n"
+                f"## {seconds_left}"
+            ),
+            colour=0xF1C40F,
+        )
+        countdown_embed.set_footer(text="Идёт обратный отсчёт")
+        await interaction.edit_original_response(
+            content=None, embed=countdown_embed, allowed_mentions=no_mentions
+        )
+        await asyncio.sleep(1)
+
+    selected = secrets.SystemRandom().sample(eligible, winners)
+    await interaction.edit_original_response(
+        content=None,
+        embed=discord.Embed(
+            title="Розыгрыш завершён",
+            description=f"**Приз:** {prize}\n\nПобедители объявлены ниже.",
+            colour=0x57F287,
+        ),
+        allowed_mentions=no_mentions,
+    )
+
+    winner_lines = [
+        f"**{index}.** {member.mention} — Discord ID: {member.id}"
+        for index, member in enumerate(selected, 1)
+    ]
+    winner_embed = discord.Embed(
+        title="WINNERS",
+        description=f"**Приз:** {prize}\n\n" + "\n".join(winner_lines),
+        colour=0x57F287,
+    )
+    winner_embed.set_footer(
+        text=f"Запустил: {interaction.user} · случайный выбор без повторов"
+    )
+    await interaction.channel.send(
+        embed=winner_embed,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
 
 
 bot.run(DISCORD_TOKEN)
