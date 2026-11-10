@@ -3250,6 +3250,203 @@ async def ticket_roles(interaction: discord.Interaction, team: str | None = None
     await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_PINGS)
 
 
+
+async def build_ticket_sync_check_report(client: discord.Client) -> tuple[str, int]:
+    """Проверить всю конфигурацию синхронизации без изменения ролей."""
+    lines = ["**Проверка синхронизации составов**", ""]
+    problems = 0
+
+    def add(ok: bool, text: str):
+        nonlocal problems
+        lines.append(("✅ " if ok else "❌ ") + text)
+        if not ok:
+            problems += 1
+
+    add(MEMBERS_OK, "Server Members Intent включён." if MEMBERS_OK else
+        "Server Members Intent выключен в Discord Developer Portal.")
+
+    target_id = cfg_id("ticket_sync_target_guild")
+    target = client.get_guild(target_id) if target_id else None
+    add(bool(target_id), "Community сохранён в настройках." if target_id else
+        "Community не настроен: запусти /ticket_sync_panel в паблике.")
+    if target_id:
+        add(target is not None,
+            f"Community: {target.name} ({target.id})." if target is not None else
+            f"Бот не видит настроенный Community с ID {target_id}.")
+
+    owner_id = cfg_id("ticket_sync_report_owner")
+    add(bool(owner_id),
+        f"Получатель отчётов настроен: <@{owner_id}>." if owner_id else
+        "Получатель отчётов не настроен: заново запусти /ticket_sync_panel в паблике.")
+
+    active_target_roles: dict[str, discord.Role] = {}
+    if target is not None:
+        lines += ["", "**Роли в Community**"]
+        group_roles = {
+            "main": target.get_role(cfg_id("ticket_group_main")),
+            "second": target.get_role(cfg_id("ticket_group_second")),
+        }
+        for team, role in group_roles.items():
+            add(role is not None,
+                f"{TICKET_SYNC_TEAM_LABELS[team]}: {role.name} ({role.id})." if role else
+                f"{TICKET_SYNC_TEAM_LABELS[team]}: роль состава не настроена.")
+
+        for role_slug, key in TICKET_ROLE_CONFIG_KEYS.items():
+            role_id = cfg_id(key)
+            role = target.get_role(role_id) if role_id else None
+            if role is not None:
+                active_target_roles[role_slug] = role
+                add(True, f"{TICKET_ROLE_LABELS[role_slug]}: {role.name} ({role.id}).")
+            elif role_id:
+                add(False, f"{TICKET_ROLE_LABELS[role_slug]}: настроенная роль удалена (ID {role_id}).")
+            else:
+                lines.append(f"➖ {TICKET_ROLE_LABELS[role_slug]}: не используется.")
+
+        add(bool(active_target_roles),
+            f"Направлений для синхронизации: {len(active_target_roles)}." if active_target_roles else
+            "Не настроено ни одного направления в Community.")
+
+        me = target.me
+        add(me is not None and me.guild_permissions.manage_roles,
+            "У бота есть право «Управлять ролями» в Community." if
+            me is not None and me.guild_permissions.manage_roles else
+            "У бота нет права «Управлять ролями» в Community.")
+        if me is not None:
+            controlled = [*group_roles.values(), *active_target_roles.values()]
+            unavailable = [
+                role.name for role in controlled
+                if role is not None and (role.managed or role >= me.top_role)
+            ]
+            add(not unavailable,
+                "Все настроенные роли находятся ниже роли бота." if not unavailable else
+                "Бот не может управлять ролями: " + ", ".join(unavailable) + ".")
+
+    source_ids = []
+    for team in ("main", "second"):
+        lines += ["", f"**Приватка · {TICKET_SYNC_TEAM_LABELS[team]}**"]
+        source_id = cfg_id(ticket_sync_source_guild_key(team))
+        source_ids.append(source_id)
+        source = client.get_guild(source_id) if source_id else None
+        add(bool(source_id),
+            "Сервер сохранён в настройках." if source_id else
+            f"Приватка не настроена: запусти в ней /ticket_roles team:{TICKET_SYNC_TEAM_LABELS[team]}.")
+        if source_id:
+            add(source is not None,
+                f"Сервер: {source.name} ({source.id})." if source is not None else
+                f"Бот не видит настроенную приватку с ID {source_id}.")
+        if source is not None:
+            for role_slug in active_target_roles:
+                role_id = cfg_id(ticket_sync_source_role_key(team, role_slug))
+                role = source.get_role(role_id) if role_id else None
+                add(role is not None,
+                    f"{TICKET_ROLE_LABELS[role_slug]} → {role.name} ({role.id})." if role else
+                    f"{TICKET_ROLE_LABELS[role_slug]} → не сопоставлена роль в этой приватке.")
+
+    configured_ids = [guild_id for guild_id in [target_id, *source_ids] if guild_id]
+    if len(configured_ids) > 1:
+        add(len(configured_ids) == len(set(configured_ids)),
+            "Community и приватки настроены как разные серверы." if
+            len(configured_ids) == len(set(configured_ids)) else
+            "Один сервер ошибочно выбран сразу для нескольких назначений.")
+
+    lines += ["", "**Итог**"]
+    if problems:
+        lines.append(f"❌ Не готово. Найдено проблем: **{problems}**.")
+        lines += [
+            "",
+            "**Порядок настройки:**",
+            "1. В паблике настрой роли через /ticket_roles.",
+            "2. В Мейн-приватке запусти /ticket_roles с team:Мейн и сопоставь роли.",
+            "3. Во второй приватке запусти /ticket_roles с team:Второй состав и сопоставь роли.",
+            "4. В паблике заново запусти /ticket_sync_panel.",
+            "5. Повтори /ticket_sync_check.",
+        ]
+    else:
+        lines.append("✅ Всё необходимое настроено. Можно запускать синхронизацию.")
+    return "\n".join(lines), problems
+
+
+@bot.tree.command(name="ticket_sync_check", description="Проверить настройки синхронизации ролей")
+@app_commands.default_permissions(administrator=True)
+async def ticket_sync_check(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    report, problems = await build_ticket_sync_check_report(interaction.client)
+    if len(report) <= 1900:
+        await interaction.followup.send(report, ephemeral=True, allowed_mentions=NO_PINGS)
+        return
+    await interaction.followup.send(
+        f"Проверка завершена. Найдено проблем: {problems}. Полный отчёт прикреплён.",
+        file=discord.File(io.BytesIO(report.encode("utf-8")), filename="ticket-sync-check.txt"),
+        ephemeral=True,
+        allowed_mentions=NO_PINGS,
+    )
+
+
+@bot.tree.command(name="ticket_sync_reset", description="Сбросить только настройки синхронизации")
+@app_commands.describe(
+    scope="Текущий сервер или вся схема из паблика и двух приваток",
+    confirm="Обязательно включи, чтобы подтвердить сброс",
+)
+@app_commands.choices(scope=[
+    app_commands.Choice(name="Только текущий сервер", value="current"),
+    app_commands.Choice(name="Вся синхронизация", value="all"),
+])
+@app_commands.default_permissions(administrator=True)
+async def ticket_sync_reset(interaction: discord.Interaction,
+                            scope: str = "current", confirm: bool = False):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            "Сброс отменён. Запусти команду ещё раз и укажи confirm: Да.",
+            ephemeral=True,
+        )
+        return
+
+    keys: set[str] = set()
+    reset_parts = []
+    guild_id = interaction.guild.id
+
+    if scope == "all" or cfg_id("ticket_sync_target_guild") == guild_id:
+        keys.update({"ticket_sync_target_guild", "ticket_sync_report_owner",
+                     "ticket_group_main", "ticket_group_second"})
+        keys.update(TICKET_ROLE_CONFIG_KEYS.values())
+        reset_parts.append("Community")
+
+    for team in ("main", "second"):
+        if scope == "all" or cfg_id(ticket_sync_source_guild_key(team)) == guild_id:
+            keys.add(ticket_sync_source_guild_key(team))
+            keys.add(ticket_private_member_role_key(team))
+            keys.update(ticket_sync_source_role_key(team, slug) for slug in TICKET_ROLE_LABELS)
+            reset_parts.append(f"приватка «{TICKET_SYNC_TEAM_LABELS[team]}»")
+
+    if not keys:
+        await interaction.response.send_message(
+            "Для этого сервера настройки синхронизации не найдены. "
+            "Выбери scope: Вся синхронизация для полного сброса.",
+            ephemeral=True,
+        )
+        return
+
+    removed = [key for key in keys if key in store.cfg]
+    for key in keys:
+        store.cfg.pop(key, None)
+    store.save()
+
+    scope_text = ", ".join(dict.fromkeys(reset_parts))
+    await interaction.response.send_message(
+        f"Настройки сброшены: {scope_text}. Удалено значений: {len(removed)}.\n"
+        "Тикеты, логи, вайп, роли доступа и каналы приглашений не затронуты.\n"
+        "После повторной настройки запусти /ticket_sync_check.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="ticket_access", description="Разделить роли доступа к Мейн и Секонд тикетам")
 @app_commands.describe(
     main_role="Роль, которая видит и закрывает только Мейн-тикеты",
