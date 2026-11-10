@@ -4142,30 +4142,19 @@ async def randomizer(
         await asyncio.sleep(1)
 
     selected = secrets.SystemRandom().sample(eligible, winners)
-    await interaction.edit_original_response(
-        content=None,
-        embed=discord.Embed(
-            title="Розыгрыш завершён",
-            description=f"**Приз:** {prize}\n\nПобедители объявлены ниже.",
-            colour=0x57F287,
-        ),
-        allowed_mentions=no_mentions,
-    )
-
     winner_lines = [
         f"**{index}.** {member.mention} — Discord ID: {member.id}"
         for index, member in enumerate(selected, 1)
     ]
-    winner_embed = discord.Embed(
-        title="WINNERS",
-        description=f"**Приз:** {prize}\n\n" + "\n".join(winner_lines),
-        colour=0x57F287,
+    winner_text = (
+        "## WINNERS\n"
+        f"**Приз:** {prize}\n\n"
+        + "\n".join(winner_lines)
+        + f"\n\n-# Запустил: {interaction.user} · случайный выбор без повторов"
     )
-    winner_embed.set_footer(
-        text=f"Запустил: {interaction.user} · случайный выбор без повторов"
-    )
-    await interaction.channel.send(
-        embed=winner_embed,
+    await interaction.edit_original_response(
+        content=winner_text,
+        embed=None,
         allowed_mentions=discord.AllowedMentions(
             users=True, roles=False, everyone=False
         ),
