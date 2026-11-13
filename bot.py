@@ -4172,34 +4172,19 @@ async def report(interaction: discord.Interaction):
 
 
 
-@bot.tree.command(name="moderators_setup", description="Создать канал с 10 блоками закреплённых игроков")
-@app_commands.describe(channel="Существующий канал; если не выбрать, бот создаст закрытый")
+@bot.tree.command(name="moderators_setup", description="Выложить в текущий канал 10 блоков игроков")
 @app_commands.default_permissions(administrator=True)
-async def moderators_setup(interaction: discord.Interaction,
-                           channel: discord.TextChannel | None = None):
+async def moderators_setup(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
-    if interaction.guild is None:
-        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Запусти команду в готовом текстовом канале.", ephemeral=True
+        )
         return
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
-    if channel is None:
-        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        if guild.me is not None:
-            overwrites[guild.me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
-            )
-        try:
-            channel = await guild.create_text_channel(
-                "контроль-состава", overwrites=overwrites,
-                reason=f"Настройка блоков модераторов: {interaction.user}",
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "Не смог создать канал. Дай боту право «Управлять каналами».", ephemeral=True
-            )
-            return
+    channel = interaction.channel
     async with moderator_roster_lock(guild.id):
         roster = moderator_roster(guild.id, create=True)
         if int(roster.get("channel_id") or 0) != channel.id:
@@ -4208,20 +4193,9 @@ async def moderators_setup(interaction: discord.Interaction,
             for block in roster["blocks"].values():
                 block["message_id"] = 0
         store.save()
-        for number in configured_moderator_blocks(roster):
-            moderator_id = int(roster["blocks"][str(number)]["moderator_id"])
-            moderator = guild.get_member(moderator_id)
-            if moderator is not None:
-                try:
-                    await channel.set_permissions(
-                        moderator, view_channel=True, read_message_history=True, send_messages=False,
-                        reason="Доступ к закреплённым игрокам",
-                    )
-                except discord.Forbidden:
-                    pass
         await update_all_moderator_blocks(guild, roster)
     await interaction.followup.send(
-        f"Готово: {channel.mention}. Созданы 10 блоков. "
+        f"Готово: в {channel.mention} выложены 10 блоков. "
         "Теперь назначь модераторов через `/moderators_set`.", ephemeral=True,
     )
 
