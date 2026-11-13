@@ -94,6 +94,7 @@ class Store:
         self.main_voice_seconds: dict[str, float] = {}
         self.main_voice_active: dict[str, float] = {}
         self.main_voice_pending: dict = {}
+        self.moderator_rosters: dict[str, dict] = {}  # guild id -> 10 блоков модераторов
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -115,6 +116,7 @@ class Store:
                 str(k): float(v) for k, v in d.get("main_voice_active", {}).items()
             }
             self.main_voice_pending = d.get("main_voice_pending", {}) or {}
+            self.moderator_rosters = d.get("moderator_rosters", {}) or {}
 
     def save(self):
         self.heartbeat = time.time()
@@ -139,7 +141,8 @@ class Store:
                                    "main_voice_window_start": self.main_voice_window_start,
                                    "main_voice_seconds": self.main_voice_seconds,
                                    "main_voice_active": self.main_voice_active,
-                                   "main_voice_pending": self.main_voice_pending}), encoding="utf-8")
+                                   "main_voice_pending": self.main_voice_pending,
+                                   "moderator_rosters": self.moderator_rosters}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -2262,6 +2265,191 @@ async def fetch_all_members(guild: discord.Guild) -> dict[int, discord.Member]:
     return members
 
 
+# ---------- закрепление игроков за 10 модераторами ----------
+MODERATOR_BLOCK_COUNT = 10
+MODERATOR_ROSTER_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def moderator_roster_lock(guild_id: int) -> asyncio.Lock:
+    return MODERATOR_ROSTER_LOCKS.setdefault(guild_id, asyncio.Lock())
+
+
+def moderator_roster(guild_id: int, create: bool = False) -> dict | None:
+    key = str(guild_id)
+    if create and key not in store.moderator_rosters:
+        store.moderator_rosters[key] = {
+            "channel_id": 0,
+            "last_alert_message_id": 0,
+            "blocks": {
+                str(number): {
+                    "moderator_id": 0,
+                    "player_ids": [],
+                    "message_id": 0,
+                }
+                for number in range(1, MODERATOR_BLOCK_COUNT + 1)
+            },
+        }
+    roster = store.moderator_rosters.get(key)
+    if roster is None:
+        return None
+    blocks = roster.setdefault("blocks", {})
+    for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+        block = blocks.setdefault(str(number), {})
+        block.setdefault("moderator_id", 0)
+        block.setdefault("player_ids", [])
+        block.setdefault("message_id", 0)
+    roster.setdefault("channel_id", 0)
+    roster.setdefault("last_alert_message_id", 0)
+    return roster
+
+
+def moderator_block_text(number: int, block: dict) -> str:
+    moderator_id = int(block.get("moderator_id") or 0)
+    player_ids = [int(uid) for uid in block.get("player_ids", []) if int(uid)]
+    moderator_text = f"<@{moderator_id}> (`{moderator_id}`)" if moderator_id else "*не назначен*"
+    lines = [
+        f"## Блок {number}",
+        f"**Модератор:** {moderator_text}",
+        f"**Игроки: {len(player_ids)}**",
+    ]
+    if player_ids:
+        lines.extend(
+            f"{index}. <@{uid}> (`{uid}`)"
+            for index, uid in enumerate(player_ids, 1)
+        )
+    else:
+        lines.append("*Игроков пока нет.*")
+    return "\n".join(lines)
+
+
+async def moderator_roster_channel(guild: discord.Guild, roster: dict) -> discord.TextChannel | None:
+    channel_id = int(roster.get("channel_id") or 0)
+    channel = guild.get_channel(channel_id) if channel_id else None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def update_moderator_block(guild: discord.Guild, number: int, roster: dict | None = None):
+    roster = roster or moderator_roster(guild.id)
+    if roster is None:
+        return
+    channel = await moderator_roster_channel(guild, roster)
+    if channel is None:
+        return
+    block = roster["blocks"][str(number)]
+    message = None
+    message_id = int(block.get("message_id") or 0)
+    if message_id:
+        try:
+            message = await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden):
+            message = None
+    content = moderator_block_text(number, block)
+    if message is None:
+        message = await channel.send(content, allowed_mentions=NO_PINGS)
+        block["message_id"] = message.id
+        store.save()
+    else:
+        await message.edit(content=content, allowed_mentions=NO_PINGS)
+
+
+async def update_all_moderator_blocks(guild: discord.Guild, roster: dict | None = None):
+    roster = roster or moderator_roster(guild.id)
+    if roster is None:
+        return
+    for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+        await update_moderator_block(guild, number, roster)
+
+
+async def send_moderator_roster_alert(guild: discord.Guild, roster: dict, text: str):
+    """В канале остаётся только последнее уведомление с тегом."""
+    channel = await moderator_roster_channel(guild, roster)
+    if channel is None:
+        return
+    previous_id = int(roster.get("last_alert_message_id") or 0)
+    if previous_id:
+        try:
+            previous = await channel.fetch_message(previous_id)
+            await previous.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+    alert = await channel.send(
+        text,
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+    roster["last_alert_message_id"] = alert.id
+    store.save()
+
+
+def find_moderator_player_block(roster: dict, member_id: int) -> int | None:
+    for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+        if member_id in [int(uid) for uid in roster["blocks"][str(number)].get("player_ids", [])]:
+            return number
+    return None
+
+
+def configured_moderator_blocks(roster: dict) -> list[int]:
+    return [
+        number for number in range(1, MODERATOR_BLOCK_COUNT + 1)
+        if int(roster["blocks"][str(number)].get("moderator_id") or 0)
+    ]
+
+
+async def auto_assign_moderator_player(member: discord.Member) -> bool:
+    roster = moderator_roster(member.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        return False
+    async with moderator_roster_lock(member.guild.id):
+        if find_moderator_player_block(roster, member.id) is not None:
+            return False
+        blocks = configured_moderator_blocks(roster)
+        moderator_ids = {
+            int(roster["blocks"][str(number)].get("moderator_id") or 0)
+            for number in blocks
+        }
+        if not blocks or member.id in moderator_ids:
+            return False
+        number = min(
+            blocks,
+            key=lambda item: (len(roster["blocks"][str(item)].get("player_ids", [])), item),
+        )
+        block = roster["blocks"][str(number)]
+        block.setdefault("player_ids", []).append(member.id)
+        store.save()
+        await update_moderator_block(member.guild, number, roster)
+        moderator_id = int(block.get("moderator_id") or 0)
+        await send_moderator_roster_alert(
+            member.guild,
+            roster,
+            f"<@{moderator_id}> Новый игрок {member.mention} (`{member.id}`) "
+            f"автоматически закреплён за вами в **блоке {number}**.",
+        )
+        return True
+
+
+async def remove_departed_moderator_player(member: discord.Member) -> bool:
+    roster = moderator_roster(member.guild.id)
+    if roster is None:
+        return False
+    async with moderator_roster_lock(member.guild.id):
+        number = find_moderator_player_block(roster, member.id)
+        if number is None:
+            return False
+        block = roster["blocks"][str(number)]
+        block["player_ids"] = [
+            uid for uid in block.get("player_ids", []) if int(uid) != member.id
+        ]
+        store.save()
+        await update_moderator_block(member.guild, number, roster)
+        moderator_id = int(block.get("moderator_id") or 0)
+        await send_moderator_roster_alert(
+            member.guild,
+            roster,
+            f"<@{moderator_id}> Игрок **{discord.utils.escape_markdown(str(member))}** "
+            f"(`{member.id}`) вышел с сервера и удалён из **блока {number}**.",
+        )
+        return True
+
+
 def sync_member_name(member: discord.Member) -> str:
     return f"{member} ({member.id})"
 
@@ -2694,6 +2882,18 @@ class Bot(discord.Client):
         if member.bot:
             return
         await apply_pending_private_roles(member)
+        try:
+            await auto_assign_moderator_player(member)
+        except Exception as e:
+            print(f"Не удалось закрепить нового игрока за модератором: {short_error(e)}", flush=True)
+
+    async def on_member_remove(self, member: discord.Member):
+        if member.bot:
+            return
+        try:
+            await remove_departed_moderator_player(member)
+        except Exception as e:
+            print(f"Не удалось убрать вышедшего игрока из блока модератора: {short_error(e)}", flush=True)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         removed = [
@@ -3970,6 +4170,242 @@ async def report(interaction: discord.Interaction):
     await post_report(interaction.channel)
     await interaction.followup.send("Сводка выложена.", ephemeral=True)
 
+
+
+@bot.tree.command(name="moderators_setup", description="Создать канал с 10 блоками закреплённых игроков")
+@app_commands.describe(channel="Существующий канал; если не выбрать, бот создаст закрытый")
+@app_commands.default_permissions(administrator=True)
+async def moderators_setup(interaction: discord.Interaction,
+                           channel: discord.TextChannel | None = None):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if channel is None:
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        if guild.me is not None:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
+            )
+        try:
+            channel = await guild.create_text_channel(
+                "контроль-состава", overwrites=overwrites,
+                reason=f"Настройка блоков модераторов: {interaction.user}",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Не смог создать канал. Дай боту право «Управлять каналами».", ephemeral=True
+            )
+            return
+    async with moderator_roster_lock(guild.id):
+        roster = moderator_roster(guild.id, create=True)
+        if int(roster.get("channel_id") or 0) != channel.id:
+            roster["channel_id"] = channel.id
+            roster["last_alert_message_id"] = 0
+            for block in roster["blocks"].values():
+                block["message_id"] = 0
+        store.save()
+        for number in configured_moderator_blocks(roster):
+            moderator_id = int(roster["blocks"][str(number)]["moderator_id"])
+            moderator = guild.get_member(moderator_id)
+            if moderator is not None:
+                try:
+                    await channel.set_permissions(
+                        moderator, view_channel=True, read_message_history=True, send_messages=False,
+                        reason="Доступ к закреплённым игрокам",
+                    )
+                except discord.Forbidden:
+                    pass
+        await update_all_moderator_blocks(guild, roster)
+    await interaction.followup.send(
+        f"Готово: {channel.mention}. Созданы 10 блоков. "
+        "Теперь назначь модераторов через `/moderators_set`.", ephemeral=True,
+    )
+
+
+@bot.tree.command(name="moderators_set", description="Назначить модератора на один из 10 блоков")
+@app_commands.describe(slot="Номер блока от 1 до 10", moderator="Модератор этого блока")
+@app_commands.default_permissions(administrator=True)
+async def moderators_set(interaction: discord.Interaction,
+                         slot: app_commands.Range[int, 1, 10],
+                         moderator: discord.Member):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None or moderator.bot:
+        await interaction.response.send_message("Выбери обычного участника сервера.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    async with moderator_roster_lock(guild.id):
+        block = roster["blocks"][str(slot)]
+        old_moderator_id = int(block.get("moderator_id") or 0)
+        changed_blocks = {int(slot)}
+        for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+            other = roster["blocks"][str(number)]
+            if number != int(slot) and int(other.get("moderator_id") or 0) == moderator.id:
+                other["moderator_id"] = 0
+                changed_blocks.add(number)
+            before = list(other.get("player_ids", []))
+            other["player_ids"] = [uid for uid in before if int(uid) != moderator.id]
+            if other["player_ids"] != before:
+                changed_blocks.add(number)
+        block["moderator_id"] = moderator.id
+        store.save()
+        channel = await moderator_roster_channel(guild, roster)
+        if channel is not None:
+            try:
+                await channel.set_permissions(
+                    moderator, view_channel=True, read_message_history=True, send_messages=False,
+                    reason="Назначен модератором блока",
+                )
+                still_used = any(
+                    int(item.get("moderator_id") or 0) == old_moderator_id
+                    for item in roster["blocks"].values()
+                )
+                old_moderator = guild.get_member(old_moderator_id)
+                if old_moderator is not None and old_moderator_id != moderator.id and not still_used:
+                    await channel.set_permissions(
+                        old_moderator, overwrite=None, reason="Больше не закреплён за блоком"
+                    )
+            except discord.Forbidden:
+                pass
+        for number in sorted(changed_blocks):
+            await update_moderator_block(guild, number, roster)
+    await interaction.followup.send(
+        f"{moderator.mention} назначен на блок **{slot}**.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="moderators_distribute", description="Равномерно распределить сервер между модераторами")
+@app_commands.default_permissions(administrator=True)
+async def moderators_distribute(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    blocks = configured_moderator_blocks(roster)
+    if not blocks:
+        await interaction.response.send_message(
+            "Сначала назначь хотя бы одного модератора через `/moderators_set`.", ephemeral=True
+        )
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Включи Server Members Intent в Discord Developer Portal и перезапусти бота.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    try:
+        members = await fetch_all_members(guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось получить участников: {short_error(e)}", ephemeral=True
+        )
+        return
+    async with moderator_roster_lock(guild.id):
+        moderator_ids = {
+            int(roster["blocks"][str(number)].get("moderator_id") or 0) for number in blocks
+        }
+        players = sorted(
+            (member for member in members.values() if member.id not in moderator_ids),
+            key=lambda member: (member.display_name.casefold(), member.id),
+        )
+        for block in roster["blocks"].values():
+            block["player_ids"] = []
+        for index, member in enumerate(players):
+            number = blocks[index % len(blocks)]
+            roster["blocks"][str(number)]["player_ids"].append(member.id)
+        store.save()
+        await update_all_moderator_blocks(guild, roster)
+    counts = ", ".join(
+        f"{number}: {len(roster['blocks'][str(number)]['player_ids'])}" for number in blocks
+    )
+    await interaction.followup.send(
+        f"Распределено игроков: **{len(players)}**. По блокам — {counts}.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="moderators_assign", description="Вручную закрепить игрока за нужным блоком")
+@app_commands.describe(player="Игрок", slot="Номер блока от 1 до 10")
+@app_commands.default_permissions(administrator=True)
+async def moderators_assign(interaction: discord.Interaction, player: discord.Member,
+                            slot: app_commands.Range[int, 1, 10]):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None or player.bot:
+        await interaction.response.send_message("Выбери обычного участника сервера.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    target = roster["blocks"][str(slot)]
+    moderator_id = int(target.get("moderator_id") or 0)
+    if not moderator_id:
+        await interaction.response.send_message("У этого блока ещё нет модератора.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with moderator_roster_lock(interaction.guild.id):
+        changed_blocks = {int(slot)}
+        for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+            block = roster["blocks"][str(number)]
+            before = list(block.get("player_ids", []))
+            block["player_ids"] = [uid for uid in before if int(uid) != player.id]
+            if block["player_ids"] != before:
+                changed_blocks.add(number)
+        target.setdefault("player_ids", []).append(player.id)
+        store.save()
+        for number in sorted(changed_blocks):
+            await update_moderator_block(interaction.guild, number, roster)
+        await send_moderator_roster_alert(
+            interaction.guild, roster,
+            f"<@{moderator_id}> Игрок {player.mention} (`{player.id}`) закреплён "
+            f"за вами в **блоке {slot}**.",
+        )
+    await interaction.followup.send(
+        f"{player.mention} закреплён за блоком **{slot}**.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="moderators_remove", description="Убрать игрока из блока модератора")
+@app_commands.describe(player="Игрок, которого нужно открепить")
+@app_commands.default_permissions(administrator=True)
+async def moderators_remove(interaction: discord.Interaction, player: discord.Member):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None:
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with moderator_roster_lock(interaction.guild.id):
+        number = find_moderator_player_block(roster, player.id)
+        if number is None:
+            await interaction.followup.send("Этот игрок ни за кем не закреплён.", ephemeral=True)
+            return
+        block = roster["blocks"][str(number)]
+        block["player_ids"] = [uid for uid in block.get("player_ids", []) if int(uid) != player.id]
+        store.save()
+        await update_moderator_block(interaction.guild, number, roster)
+    await interaction.followup.send(
+        f"{player.mention} удалён из блока **{number}**.", ephemeral=True
+    )
 
 
 @bot.tree.command(name="randomizer", description="Разыграть приз среди участников приватки")
