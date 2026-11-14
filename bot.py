@@ -2310,7 +2310,6 @@ def moderator_block_embed(number: int, block: dict) -> discord.Embed:
     player_ids = [int(uid) for uid in block.get("player_ids", []) if int(uid)]
     moderator_text = f"<@{moderator_id}> (`{moderator_id}`)" if moderator_id else "*не назначен*"
     embed = discord.Embed(
-        title=f"Блок {number:02d}",
         description=f"**Модератор**\n{moderator_text}",
         colour=0x7C3AED,
     )
