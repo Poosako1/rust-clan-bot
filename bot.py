@@ -2316,7 +2316,13 @@ def moderator_block_embed(guild: discord.Guild, number: int, block: dict) -> dis
     moderator_id = int(block.get("moderator_id") or 0)
     player_ids = [int(uid) for uid in block.get("player_ids", []) if int(uid)]
     moderator = guild.get_member(moderator_id) if moderator_id else None
-    moderator_text = moderator.mention if moderator is not None else "*не назначен*"
+    if moderator is not None:
+        moderator_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(moderator.display_name)
+        )
+        moderator_text = f"**{moderator_name}** · {moderator.mention}"
+    else:
+        moderator_text = "*не назначен*"
     embed = discord.Embed(
         description=f"**Модератор**\n{moderator_text}",
         colour=0x7C3AED,
@@ -2325,7 +2331,10 @@ def moderator_block_embed(guild: discord.Guild, number: int, block: dict) -> dis
     for index, uid in enumerate(player_ids, 1):
         member = guild.get_member(uid)
         if member is not None:
-            lines.append(f"**{index:02d}.** {member.mention}")
+            member_name = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(member.display_name)
+            )
+            lines.append(f"**{index:02d}. {member_name}** · {member.mention}")
         else:
             lines.append(f"**{index:02d}.** *участник не найден* (`{uid}`)")
     if not lines:
