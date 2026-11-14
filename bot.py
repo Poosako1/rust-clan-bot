@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 70270)
-Total output lines: 5806
+Warning: truncated output (original token count: 71211)
+Total output lines: 5876
 
 import os
 import re
@@ -2944,67 +2944,7 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …270 tokens truncated…рточка не обновилась: {short_error(e)}", flush=True)
-    except Exception as e:
-        print(f"VIS фарм {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
-
-
-async def process_vis_profile_message(message: discord.Message):
-    cfg = vis_config(message.guild.id) if message.guild else None
-    if cfg is None or message.channel.id not in [int(cid) for cid in cfg.get("profile_channel_ids", [])]:
-        return
-    member = vis_target_member(message)
-    if member is None or not message.content.strip():
-        return
-    source_type = str(cfg.get("profile_channel_types", {}).get(str(message.channel.id), "data"))
-    fields = vis_extract_profile_fields(message.content, source_type)
-    if not fields and OPENROUTER_KEY:
-        try:
-            result = await vis_openrouter_json(
-                str(cfg.get("model") or VISION_MODEL),
-                message.content,
-                "Извлеки данные профиля Rust. Верни JSON со строками steam, battlemetrics, timezone, "
-                "rt_positions. Неизвестные поля оставь пустыми. rt_positions — перечисление позиций/РТ, "
-                "которые игрок сообщил, что знает.",
-            )
-            fields = {key: str(result.get(key) or "").strip() for key in (
-                "steam", "battlemetrics", "timezone", "rt_positions"
-            )}
-        except Exception as e:
-            print(f"VIS профиль {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
-    if not any(str(value or "").strip() for value in fields.values()):
-        return
-    changed = vis_apply_profile_fields(message.guild.id, member.id, fields)
-    if changed:
-        try:
-            await refresh_vis_player_card(message.guild, member.id)
-        except Exception as e:
-            print(f"VIS: профиль сохранён, но карточка не обновилась: {short_error(e)}", flush=True)
-    try:
-        await message.delete()
-        confirmation = await message.channel.send(
-            f"{member.mention} ✅ Ответ записан",
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-        )
-        await confirmation.delete(delay=5)
-    except discord.Forbidden:
-        print(f"VIS: нет права удалять сообщения в канале {message.channel.id}", flush=True)
-
-
-def vis_safe_channel_name(member: discord.Member) -> str:
-    name = member.display_name.lower().replace("ё", "е")
-    name = re.sub(r"[^a-zа-я0-9-]+", "-", name, flags=re.I).strip("-")
-    return (f"mod-{name}" if name else f"mod-{member.id}")[:90]
-
-
-def vis_player_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
-    profile = vis_profile(guild.id, member.id) or {}
-    joined_at = member.joined_at or dt.datetime.now(dt.timezone.utc)
-    days = max(1, (dt.datetime.now(dt.timezone.utc) - joined_at).days + 1)
-    steam = profile.get("steam") or "не указан"
-    battlemetrics = profile.get("battlemetrics") or "не указан"
-    timezone = profile.get("timezone") or "не указан"
-    positions = profile.get("rt_positions") or "не указаны"
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1211 tokens truncated…") or "не указаны"
     embed = discord.Embed(
         title=member.display_name,
         description=f"{member.mention}\nВ приватке: **{days} дн.**",
@@ -3035,10 +2975,11 @@ def vis_player_embed(guild: discord.Guild, member: discord.Member) -> discord.Em
     return embed
 
 
-async def scan_vis_profile_history(guild: discord.Guild, cfg: dict) -> int:
+async def scan_vis_profile_history(guild: discord.Guild, cfg: dict,
+                                   channel_ids: list[int] | None = None) -> int:
     changed = 0
     seen_channels = set()
-    for channel_id in cfg.get("profile_channel_ids", []):
+    for channel_id in (channel_ids or cfg.get("profile_channel_ids", [])):
         channel = guild.get_channel(int(channel_id))
         if not isinstance(channel, discord.TextChannel) or channel.id in seen_channels:
             continue
@@ -5333,6 +5274,64 @@ async def vis_sync(interaction: discord.Interaction):
         f"VIS восстановлен. Каналов модераторов: **{moderators_count}**, "
         f"карточек игроков: **{cards_count}**.",
         ephemeral=True,
+    )
+
+
+@bot.tree.command(name="vis_import", description="Импортировать всю историю общего канала в карточки")
+@app_commands.describe(channel="Общий канал со Steam, BattleMetrics, часовыми поясами и РТ")
+@app_commands.default_permissions(administrator=True)
+async def vis_import(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    cfg = vis_config(interaction.guild.id)
+    if cfg is None:
+        await interaction.response.send_message("Сначала настрой систему через `/vis`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel_ids = [int(cid) for cid in cfg.get("profile_channel_ids", [])]
+    if channel.id not in channel_ids:
+        channel_ids.append(channel.id)
+    cfg["profile_channel_ids"] = channel_ids
+    cfg.setdefault("profile_channel_types", {})[str(channel.id)] = "data"
+    store.save()
+    await interaction.edit_original_response(content=f"Читаю всю историю {channel.mention}…")
+    try:
+        imported = await scan_vis_profile_history(interaction.guild, cfg, channel_ids=[channel.id])
+        await interaction.edit_original_response(content="Обновляю карточки игроков…")
+        moderators_count, cards_count = await synchronize_vis_hub(interaction.guild)
+    except Exception as e:
+        await interaction.edit_original_response(content=f"Импорт не завершён: {short_error(e)}")
+        return
+    bot_member = interaction.guild.me
+    permissions = channel.permissions_for(bot_member) if bot_member is not None else None
+    missing_permissions = []
+    if permissions is not None:
+        if not permissions.view_channel:
+            missing_permissions.append("Просматривать канал")
+        if not permissions.read_message_history:
+            missing_permissions.append("Читать историю сообщений")
+        if not permissions.send_messages:
+            missing_permissions.append("Отправлять сообщения")
+        if not permissions.manage_messages:
+            missing_permissions.append("Управлять сообщениями")
+    permission_text = (
+        "Права канала: всё настроено."
+        if not missing_permissions else
+        "Не хватает прав: " + ", ".join(missing_permissions) + "."
+    )
+    await interaction.edit_original_response(
+        content=(
+            f"Импорт завершён. Обновлено записей: **{imported}**. "
+            f"Каналов модераторов: **{moderators_count}**, карточек: **{cards_count}**.\n"
+            f"{permission_text}\n"
+            "Канал сохранён для автоматической обработки новых сообщений."
+        )
     )
 
 
