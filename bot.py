@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 71387)
-Total output lines: 5888
-
 import os
 import re
 import secrets
@@ -2944,7 +2941,110 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1387 tokens truncated…tswith("http") else battlemetrics,
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа к wood: "
+        "код сделает это сам как 1000 дерева за каждый шкаф. Если ресурс не виден, ставь 0. "
+        "Не угадывай скрытые значения и не считай один предмет дважды на нескольких скриншотах."
+    )
+    try:
+        result = await vis_openrouter_json(str(cfg.get("model") or VISION_MODEL), image_parts, prompt)
+        values = {key: vis_number(result.get(key)) for key in ("sulfur", "metal", "stone", "wood", "cupboards")}
+        if not any(values.values()):
+            print(f"VIS фарм: на сообщении {message.id} ресурсы не распознаны", flush=True)
+            return
+        vis_add_farm(message.guild.id, member.id, values)
+        for image_hash in new_hashes:
+            seen[image_hash] = time.time()
+        store.save()
+        try:
+            await refresh_vis_player_card(message.guild, member.id)
+        except Exception as e:
+            print(f"VIS: фарм сохранён, но карточка не обновилась: {short_error(e)}", flush=True)
+    except Exception as e:
+        print(f"VIS фарм {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
+
+
+async def process_vis_profile_message(message: discord.Message):
+    cfg = vis_config(message.guild.id) if message.guild else None
+    if cfg is None or message.channel.id not in [int(cid) for cid in cfg.get("profile_channel_ids", [])]:
+        return
+    member = vis_target_member(message)
+    if member is None or not message.content.strip():
+        return
+    source_type = str(cfg.get("profile_channel_types", {}).get(str(message.channel.id), "data"))
+    fields = vis_extract_profile_fields(message.content, source_type)
+    if not fields and OPENROUTER_KEY:
+        try:
+            result = await vis_openrouter_json(
+                str(cfg.get("model") or VISION_MODEL),
+                message.content,
+                "Извлеки данные профиля Rust. Верни JSON со строками steam, battlemetrics, timezone, "
+                "rt_positions. Неизвестные поля оставь пустыми. rt_positions — перечисление позиций/РТ, "
+                "которые игрок сообщил, что знает.",
+            )
+            fields = {key: str(result.get(key) or "").strip() for key in (
+                "steam", "battlemetrics", "timezone", "rt_positions"
+            )}
+        except Exception as e:
+            print(f"VIS профиль {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
+    if not any(str(value or "").strip() for value in fields.values()):
+        return
+    changed = vis_apply_profile_fields(message.guild.id, member.id, fields)
+    if changed:
+        try:
+            await refresh_vis_player_card(message.guild, member.id)
+        except Exception as e:
+            print(f"VIS: профиль сохранён, но карточка не обновилась: {short_error(e)}", flush=True)
+    deleted = True
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        deleted = False
+        print(f"VIS: нет права удалять сообщения в канале {message.channel.id}", flush=True)
+    confirmation_text = (
+        f"{member.mention} ✅ Ответ записан"
+        if deleted else
+        f"{member.mention} ⚠️ Ответ записан, но бот не может удалить сообщение: "
+        "нужно право «Управлять сообщениями»."
+    )
+    try:
+        confirmation = await message.channel.send(
+            confirmation_text,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        await confirmation.delete(delay=5 if deleted else 15)
+    except discord.Forbidden:
+        print(f"VIS: нет права отправлять сообщения в канале {message.channel.id}", flush=True)
+
+
+def vis_safe_channel_name(member: discord.Member) -> str:
+    name = member.display_name.lower().replace("ё", "е")
+    name = re.sub(r"[^a-zа-я0-9-]+", "-", name, flags=re.I).strip("-")
+    return (f"mod-{name}" if name else f"mod-{member.id}")[:90]
+
+
+def vis_player_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    profile = vis_profile(guild.id, member.id) or {}
+    joined_at = member.joined_at or dt.datetime.now(dt.timezone.utc)
+    days = max(1, (dt.datetime.now(dt.timezone.utc) - joined_at).days + 1)
+    steam = profile.get("steam") or "не указан"
+    battlemetrics = profile.get("battlemetrics") or "не указан"
+    timezone = profile.get("timezone") or "не указан"
+    positions = profile.get("rt_positions") or "не указаны"
+    embed = discord.Embed(
+        title=member.display_name,
+        description=f"{member.mention}\nВ приватке: **{days} дн.**",
+        colour=0x7C3AED,
+    )
+    steam_id_match = re.search(r"steamcommunity\.com/profiles/(\d+)", steam)
+    if steam.startswith("http"):
+        steam_label = steam_id_match.group(1) if steam_id_match else "Открыть профиль"
+        steam_value = f"[{steam_label}]({steam})"
+    else:
+        steam_value = steam
+    embed.add_field(name="Steam", value=steam_value, inline=True)
+    embed.add_field(
+        name="BattleMetrics",
+        value=f"[Открыть профиль]({battlemetrics})" if battlemetrics.startswith("http") else battlemetrics,
         inline=True,
     )
     embed.add_field(name="Часовой пояс", value=timezone, inline=True)
