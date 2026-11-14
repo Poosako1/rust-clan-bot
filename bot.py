@@ -5245,6 +5245,32 @@ async def vis(
     )
 
 
+@bot.tree.command(name="vis_sync", description="Заново создать каналы модераторов и обновить VIS-карточки")
+@app_commands.default_permissions(administrator=True)
+async def vis_sync(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    if vis_config(interaction.guild.id) is None:
+        await interaction.response.send_message("Сначала настрой систему через `/vis`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        moderators_count, cards_count = await synchronize_vis_hub(interaction.guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось восстановить VIS-каналы: {short_error(e)}", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"VIS восстановлен. Каналов модераторов: **{moderators_count}**, "
+        f"карточек игроков: **{cards_count}**.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="moderators_set", description="Вручную назначить модератора карточке")
 @app_commands.describe(slot="Номер карточки", moderator="Модератор этой карточки")
 @app_commands.default_permissions(administrator=True)
