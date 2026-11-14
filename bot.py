@@ -5075,6 +5075,46 @@ async def moderators_sync(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="moderators_reset", description="Сбросить карточки и канал распределения модераторов")
+@app_commands.default_permissions(administrator=True)
+async def moderators_reset(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None:
+        await interaction.response.send_message("Распределение ещё не настроено.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with moderator_roster_lock(interaction.guild.id):
+        channel = await moderator_roster_channel(interaction.guild, roster)
+        deleted_messages = 0
+        if channel is not None:
+            message_ids = [
+                int(block.get("message_id") or 0) for block in roster.get("blocks", {}).values()
+            ]
+            message_ids.append(int(roster.get("last_alert_message_id") or 0))
+            for message_id in set(message_id for message_id in message_ids if message_id):
+                try:
+                    await channel.get_partial_message(message_id).delete()
+                    deleted_messages += 1
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+        roster["channel_id"] = 0
+        roster["last_alert_message_id"] = 0
+        roster["blocks"] = {}
+        roster["last_auto_sync_slot"] = ""
+        store.save()
+    await interaction.followup.send(
+        f"Распределение сброшено. Удалено старых сообщений: **{deleted_messages}**. "
+        "Роль модераторов и роли-исключения сохранены. Создай новый канал и запусти в нём "
+        "`/moderators_setup`, затем `/moderators_sync`.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="moderators_unassigned", description="Показать незакреплённых игроков приватки")
 @app_commands.default_permissions(administrator=True)
 async def moderators_unassigned(interaction: discord.Interaction):
