@@ -3,6 +3,8 @@ import re
 import secrets
 import io
 import json
+import base64
+import hashlib
 import time
 import asyncio
 import difflib
@@ -31,6 +33,7 @@ EDITOR_CHANNEL_ID = int(os.environ.get("EDITOR_CHANNEL_ID", "0") or 0)  # кан
 EDITOR_ENABLED = os.environ.get("EDITOR_ENABLED", "0") == "1"   # редактор текста выключен, пока не включён явно
 INVITE_LOG_CHANNEL_ID = int(os.environ.get("INVITE_LOG_CHANNEL_ID", "1516857380221227030") or 1516857380221227030)  # канал модераторского лога удалённых инвайтов
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-2.5-flash")
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 # ================================
 
@@ -95,6 +98,12 @@ class Store:
         self.main_voice_active: dict[str, float] = {}
         self.main_voice_pending: dict = {}
         self.moderator_rosters: dict[str, dict] = {}  # guild id -> 10 блоков модераторов
+        self.vis_configs: dict[str, dict] = {}
+        self.vis_profiles: dict[str, dict] = {}
+        self.vis_farm_totals: dict[str, dict] = {}
+        self.vis_seen_images: dict[str, dict] = {}
+        self.vis_voice: list[list] = []  # [guild_id, user_id, start, end]
+        self.vis_voice_open: dict[str, float] = {}  # guild_id:user_id -> start
         if DATA_FILE.exists():
             d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             self.voice = d.get("voice", [])
@@ -117,6 +126,14 @@ class Store:
             }
             self.main_voice_pending = d.get("main_voice_pending", {}) or {}
             self.moderator_rosters = d.get("moderator_rosters", {}) or {}
+            self.vis_configs = d.get("vis_configs", {}) or {}
+            self.vis_profiles = d.get("vis_profiles", {}) or {}
+            self.vis_farm_totals = d.get("vis_farm_totals", {}) or {}
+            self.vis_seen_images = d.get("vis_seen_images", {}) or {}
+            self.vis_voice = d.get("vis_voice", []) or []
+            self.vis_voice_open = {
+                str(k): float(v) for k, v in (d.get("vis_voice_open", {}) or {}).items()
+            }
 
     def save(self):
         self.heartbeat = time.time()
@@ -130,6 +147,16 @@ class Store:
             k: v for k, v in self.private_invites.items()
             if float(v.get("created", 0)) >= invite_cutoff
         }
+        voice_cutoff = time.time() - 14 * 86400
+        self.vis_voice = [row for row in self.vis_voice if len(row) >= 4 and float(row[3]) >= voice_cutoff]
+        image_cutoff = time.time() - 180 * 86400
+        self.vis_seen_images = {
+            guild_id: {
+                image_hash: ts for image_hash, ts in hashes.items()
+                if float(ts) >= image_cutoff
+            }
+            for guild_id, hashes in self.vis_seen_images.items()
+        }
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"voice": self.voice, "open_voice": self.open_voice,
                                    "heartbeat": self.heartbeat, "wipes": self.wipes,
@@ -142,7 +169,13 @@ class Store:
                                    "main_voice_seconds": self.main_voice_seconds,
                                    "main_voice_active": self.main_voice_active,
                                    "main_voice_pending": self.main_voice_pending,
-                                   "moderator_rosters": self.moderator_rosters}), encoding="utf-8")
+                                   "moderator_rosters": self.moderator_rosters,
+                                   "vis_configs": self.vis_configs,
+                                   "vis_profiles": self.vis_profiles,
+                                   "vis_farm_totals": self.vis_farm_totals,
+                                   "vis_seen_images": self.vis_seen_images,
+                                   "vis_voice": self.vis_voice,
+                                   "vis_voice_open": self.vis_voice_open}), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
     def reconcile(self, in_voice_now: set[str]):
@@ -2578,6 +2611,532 @@ async def process_scheduled_moderator_rosters(client: discord.Client):
             print(f"Не удалось автоматически сверить модераторов {guild.id}: {short_error(e)}", flush=True)
 
 
+# ---------- VIS: карточки игроков в каналах модераторов ----------
+VIS_CATEGORY_NAME = "MODERATORS"
+STEAM_RE = re.compile(
+    r"https?://(?:www\.)?steamcommunity\.com/(?:profiles/\d+|id/[A-Za-z0-9_-]+)/?",
+    re.I,
+)
+BM_RE = re.compile(r"https?://(?:www\.)?battlemetrics\.com/players/\d+/?", re.I)
+
+
+def vis_config(guild_id: int, create: bool = False) -> dict | None:
+    key = str(guild_id)
+    if create and key not in store.vis_configs:
+        store.vis_configs[key] = {
+            "farm_channel_id": 0,
+            "profile_channel_ids": [],
+            "profile_channel_types": {},
+            "category_id": 0,
+            "moderator_channels": {},
+            "card_messages": {},
+            "model": VISION_MODEL,
+            "last_hour_slot": "",
+        }
+    cfg = store.vis_configs.get(key)
+    if cfg is None:
+        return None
+    cfg.setdefault("farm_channel_id", 0)
+    cfg.setdefault("profile_channel_ids", [])
+    cfg.setdefault("profile_channel_types", {})
+    cfg.setdefault("category_id", 0)
+    cfg.setdefault("moderator_channels", {})
+    cfg.setdefault("card_messages", {})
+    cfg.setdefault("model", VISION_MODEL)
+    cfg.setdefault("last_hour_slot", "")
+    return cfg
+
+
+def vis_profile(guild_id: int, user_id: int, create: bool = False) -> dict | None:
+    guild_profiles = store.vis_profiles.setdefault(str(guild_id), {}) if create else store.vis_profiles.get(str(guild_id), {})
+    key = str(user_id)
+    if create and key not in guild_profiles:
+        guild_profiles[key] = {
+            "steam": "",
+            "battlemetrics": "",
+            "timezone": "",
+            "rt_positions": "",
+            "updated_at": 0,
+        }
+    return guild_profiles.get(key)
+
+
+def vis_voice_key(guild_id: int, user_id: int) -> str:
+    return f"{guild_id}:{user_id}"
+
+
+def vis_voice_start(guild_id: int, user_id: int, now: float | None = None):
+    store.vis_voice_open.setdefault(vis_voice_key(guild_id, user_id), now or time.time())
+    store.save()
+
+
+def vis_voice_stop(guild_id: int, user_id: int, now: float | None = None):
+    key = vis_voice_key(guild_id, user_id)
+    started = store.vis_voice_open.pop(key, None)
+    if started is not None:
+        store.vis_voice.append([str(guild_id), str(user_id), started, now or time.time()])
+    store.save()
+
+
+def reconcile_vis_voice(client: discord.Client):
+    current = {
+        vis_voice_key(guild.id, member.id)
+        for guild in client.guilds
+        for channel in guild.voice_channels
+        for member in channel.members
+        if not member.bot
+    }
+    for key, started in list(store.vis_voice_open.items()):
+        if key not in current:
+            guild_id, user_id = key.split(":", 1)
+            store.vis_voice.append([guild_id, user_id, started, max(started, store.heartbeat)])
+            del store.vis_voice_open[key]
+    now = time.time()
+    for key in current:
+        store.vis_voice_open.setdefault(key, now)
+    store.save()
+
+
+def vis_voice_today_seconds(guild_id: int, user_id: int, now: float | None = None) -> float:
+    current = now or time.time()
+    local_now = dt.datetime.fromtimestamp(current, MAIN_VOICE_TZ)
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    total = 0.0
+    for row in store.vis_voice:
+        if len(row) < 4 or int(row[0]) != guild_id or int(row[1]) != user_id:
+            continue
+        start, end = float(row[2]), float(row[3])
+        total += max(0.0, min(end, current) - max(start, midnight))
+    started = store.vis_voice_open.get(vis_voice_key(guild_id, user_id))
+    if started is not None:
+        total += max(0.0, current - max(float(started), midnight))
+    return total
+
+
+def vis_duration(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes:02d} мин"
+
+
+def vis_target_member(message: discord.Message) -> discord.Member | None:
+    mentioned = next((member for member in message.mentions if not member.bot), None)
+    return mentioned or (message.author if isinstance(message.author, discord.Member) and not message.author.bot else None)
+
+
+def vis_extract_profile_fields(text: str, source_type: str = "data") -> dict[str, str]:
+    out: dict[str, str] = {}
+    steam = STEAM_RE.search(text)
+    battlemetrics = BM_RE.search(text)
+    if steam:
+        out["steam"] = steam.group(0).rstrip("/")
+    if battlemetrics:
+        out["battlemetrics"] = battlemetrics.group(0).rstrip("/")
+    timezone_match = re.search(
+        r"(?:(?:часов(?:ой|ого)\s+пояс\w*|utc|gmt|мск)\s*[:=]?\s*)([+-]?\s*\d{1,2})",
+        text,
+        re.I,
+    )
+    if timezone_match:
+        offset = timezone_match.group(1).replace(" ", "")
+        if not offset.startswith(("+", "-")):
+            offset = f"+{offset}"
+        out["timezone"] = f"UTC{offset}"
+    elif source_type == "timezone":
+        simple_offset = re.search(r"[+-]?\s*\d{1,2}", text)
+        if simple_offset:
+            offset = simple_offset.group(0).replace(" ", "")
+            if not offset.startswith(("+", "-")):
+                offset = f"+{offset}"
+            out["timezone"] = f"UTC{offset}"
+        elif "мск" in text.lower():
+            out["timezone"] = "UTC+3 (МСК)"
+    positions_match = re.search(
+        r"(?:позици\w*\s+(?:на\s+)?рт|знаю\s+(?:позици\w*\s+)?(?:на\s+)?рт)\s*[:=-]?\s*(.+)",
+        text,
+        re.I | re.S,
+    )
+    if positions_match:
+        out["rt_positions"] = positions_match.group(1).strip()[:500]
+    elif source_type == "positions":
+        cleaned = re.sub(r"<@!?\d+>", "", text).strip(" :-\n\t")
+        if cleaned:
+            out["rt_positions"] = cleaned[:500]
+    return out
+
+
+def vis_apply_profile_fields(guild_id: int, user_id: int, fields: dict[str, str]) -> bool:
+    clean = {key: str(value).strip() for key, value in fields.items() if str(value).strip()}
+    if not clean:
+        return False
+    profile = vis_profile(guild_id, user_id, create=True)
+    changed = False
+    for key in ("steam", "battlemetrics", "timezone", "rt_positions"):
+        value = clean.get(key)
+        if value and profile.get(key) != value:
+            profile[key] = value
+            changed = True
+    if changed:
+        profile["updated_at"] = time.time()
+        store.save()
+    return changed
+
+
+def parse_openrouter_json(text: str) -> dict:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start >= 0 and end >= start:
+        cleaned = cleaned[start:end + 1]
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("модель вернула не объект JSON")
+    return data
+
+
+async def vis_openrouter_json(model: str, content: list[dict] | str, prompt: str) -> dict:
+    if not OPENROUTER_KEY:
+        raise RuntimeError("OPENROUTER_KEY не настроен на сервере")
+    user_content = ([{"type": "text", "text": prompt}] + content) if isinstance(content, list) else f"{prompt}\n\n{content}"
+    body = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "Отвечай только корректным JSON без markdown."},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "X-Title": "rust-clan-bot-vis"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+        async with session.post(OPENROUTER_URL, json=body, headers=headers) as response:
+            payload = await response.json(content_type=None)
+            if response.status >= 400:
+                error = payload.get("error", {}) if isinstance(payload, dict) else {}
+                raise RuntimeError(f"OpenRouter {response.status}: {error.get('message') or payload}")
+    return parse_openrouter_json(payload["choices"][0]["message"]["content"])
+
+
+def vis_number(value) -> int:
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value or "0").strip().lower().replace(" ", "").replace(",", ".")
+    multiplier = 1000 if text.endswith(("k", "к", "тыс")) else 1
+    text = re.sub(r"(?:k|к|тыс)$", "", text)
+    try:
+        return max(0, int(float(text) * multiplier))
+    except ValueError:
+        return 0
+
+
+def vis_farm_day_key(timestamp: float | None = None) -> str:
+    return dt.datetime.fromtimestamp(timestamp or time.time(), MAIN_VOICE_TZ).strftime("%Y-%m-%d")
+
+
+def vis_add_farm(guild_id: int, user_id: int, values: dict):
+    guild_totals = store.vis_farm_totals.setdefault(str(guild_id), {})
+    player_totals = guild_totals.setdefault(str(user_id), {})
+    day = player_totals.setdefault(
+        vis_farm_day_key(),
+        {"sulfur": 0, "metal": 0, "stone": 0, "wood": 0, "cupboards": 0},
+    )
+    cupboards = vis_number(values.get("cupboards"))
+    day["sulfur"] += vis_number(values.get("sulfur"))
+    day["metal"] += vis_number(values.get("metal"))
+    day["stone"] += vis_number(values.get("stone"))
+    day["wood"] += vis_number(values.get("wood")) + cupboards * 1000
+    day["cupboards"] += cupboards
+    store.save()
+
+
+def vis_farm_sum(guild_id: int, user_id: int, days: int) -> dict[str, int]:
+    out = {"sulfur": 0, "metal": 0, "stone": 0, "wood": 0, "cupboards": 0}
+    totals = store.vis_farm_totals.get(str(guild_id), {}).get(str(user_id), {})
+    today = dt.datetime.now(MAIN_VOICE_TZ).date()
+    accepted = {(today - dt.timedelta(days=offset)).isoformat() for offset in range(days)}
+    for day_key, values in totals.items():
+        if day_key not in accepted:
+            continue
+        for key in out:
+            out[key] += vis_number(values.get(key))
+    return out
+
+
+def vis_farm_text(values: dict[str, int]) -> str:
+    return (
+        f"Сера: **{values['sulfur']:,}**\n"
+        f"Металл: **{values['metal']:,}**\n"
+        f"Камень: **{values['stone']:,}**\n"
+        f"Дерево: **{values['wood']:,}**\n"
+        f"Шкафы: **{values['cupboards']}**"
+    ).replace(",", " ")
+
+
+async def process_vis_farm_message(message: discord.Message):
+    cfg = vis_config(message.guild.id) if message.guild else None
+    if cfg is None or message.channel.id != int(cfg.get("farm_channel_id") or 0):
+        return
+    member = vis_target_member(message)
+    if member is None:
+        return
+    image_parts, new_hashes = [], []
+    seen = store.vis_seen_images.setdefault(str(message.guild.id), {})
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").lower()
+        if not content_type.startswith("image/") and not attachment.filename.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp")
+        ):
+            continue
+        raw = await attachment.read()
+        image_hash = hashlib.sha256(raw).hexdigest()
+        if image_hash in seen:
+            continue
+        mime = content_type if content_type.startswith("image/") else "image/png"
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"},
+        })
+        new_hashes.append(image_hash)
+    if not image_parts:
+        return
+    prompt = (
+        "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
+        "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа к wood: "
+        "код сделает это сам как 1000 дерева за каждый шкаф. Если ресурс не виден, ставь 0. "
+        "Не угадывай скрытые значения и не считай один предмет дважды на нескольких скриншотах."
+    )
+    try:
+        result = await vis_openrouter_json(str(cfg.get("model") or VISION_MODEL), image_parts, prompt)
+        values = {key: vis_number(result.get(key)) for key in ("sulfur", "metal", "stone", "wood", "cupboards")}
+        if not any(values.values()):
+            print(f"VIS фарм: на сообщении {message.id} ресурсы не распознаны", flush=True)
+            return
+        vis_add_farm(message.guild.id, member.id, values)
+        for image_hash in new_hashes:
+            seen[image_hash] = time.time()
+        store.save()
+    except Exception as e:
+        print(f"VIS фарм {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
+
+
+async def process_vis_profile_message(message: discord.Message):
+    cfg = vis_config(message.guild.id) if message.guild else None
+    if cfg is None or message.channel.id not in [int(cid) for cid in cfg.get("profile_channel_ids", [])]:
+        return
+    member = vis_target_member(message)
+    if member is None or not message.content.strip():
+        return
+    source_type = str(cfg.get("profile_channel_types", {}).get(str(message.channel.id), "data"))
+    fields = vis_extract_profile_fields(message.content, source_type)
+    if not fields and OPENROUTER_KEY:
+        try:
+            result = await vis_openrouter_json(
+                str(cfg.get("model") or VISION_MODEL),
+                message.content,
+                "Извлеки данные профиля Rust. Верни JSON со строками steam, battlemetrics, timezone, "
+                "rt_positions. Неизвестные поля оставь пустыми. rt_positions — перечисление позиций/РТ, "
+                "которые игрок сообщил, что знает.",
+            )
+            fields = {key: str(result.get(key) or "").strip() for key in (
+                "steam", "battlemetrics", "timezone", "rt_positions"
+            )}
+        except Exception as e:
+            print(f"VIS профиль {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
+    if not vis_apply_profile_fields(message.guild.id, member.id, fields):
+        return
+    try:
+        await message.delete()
+        confirmation = await message.channel.send("✅ Ответ записан", allowed_mentions=NO_PINGS)
+        await confirmation.delete(delay=5)
+    except discord.Forbidden:
+        print(f"VIS: нет права удалять сообщения в канале {message.channel.id}", flush=True)
+
+
+def vis_safe_channel_name(member: discord.Member) -> str:
+    name = member.display_name.lower().replace("ё", "е")
+    name = re.sub(r"[^a-zа-я0-9-]+", "-", name, flags=re.I).strip("-")
+    return (f"mod-{name}" if name else f"mod-{member.id}")[:90]
+
+
+def vis_player_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    profile = vis_profile(guild.id, member.id) or {}
+    joined_at = member.joined_at or dt.datetime.now(dt.timezone.utc)
+    days = max(1, (dt.datetime.now(dt.timezone.utc) - joined_at).days + 1)
+    steam = profile.get("steam") or "не указан"
+    battlemetrics = profile.get("battlemetrics") or "не указан"
+    timezone = profile.get("timezone") or "не указан"
+    positions = profile.get("rt_positions") or "не указаны"
+    embed = discord.Embed(
+        title=member.display_name,
+        description=f"{member.mention}\nВ приватке: **{days} дн.**",
+        colour=0x7C3AED,
+    )
+    embed.add_field(
+        name="Steam",
+        value=f"[Открыть профиль]({steam})" if steam.startswith("http") else steam,
+        inline=True,
+    )
+    embed.add_field(
+        name="BattleMetrics",
+        value=f"[Открыть профиль]({battlemetrics})" if battlemetrics.startswith("http") else battlemetrics,
+        inline=True,
+    )
+    embed.add_field(name="Часовой пояс", value=timezone, inline=True)
+    embed.add_field(name="Позиции на РТ", value=str(positions)[:1024], inline=False)
+    embed.add_field(
+        name="Голосовой онлайн сегодня",
+        value=vis_duration(vis_voice_today_seconds(guild.id, member.id)),
+        inline=False,
+    )
+    embed.add_field(name="Фарм сегодня", value=vis_farm_text(vis_farm_sum(guild.id, member.id, 1)), inline=True)
+    embed.add_field(name="Фарм за 7 дней", value=vis_farm_text(vis_farm_sum(guild.id, member.id, 7)), inline=True)
+    embed.set_footer(text="CL Team")
+    return embed
+
+
+async def scan_vis_profile_history(guild: discord.Guild, cfg: dict) -> int:
+    changed = 0
+    seen_channels = set()
+    for channel_id in cfg.get("profile_channel_ids", []):
+        channel = guild.get_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel) or channel.id in seen_channels:
+            continue
+        seen_channels.add(channel.id)
+        async for message in channel.history(limit=None, oldest_first=True):
+            if message.author.bot or not message.content.strip():
+                continue
+            member = vis_target_member(message)
+            if member is None:
+                continue
+            source_type = str(cfg.get("profile_channel_types", {}).get(str(channel.id), "data"))
+            fields = vis_extract_profile_fields(message.content, source_type)
+            if fields and vis_apply_profile_fields(guild.id, member.id, fields):
+                changed += 1
+    return changed
+
+
+async def ensure_vis_category(guild: discord.Guild, cfg: dict, moderator_role: discord.Role) -> discord.CategoryChannel:
+    category = guild.get_channel(int(cfg.get("category_id") or 0))
+    if not isinstance(category, discord.CategoryChannel):
+        category = discord.utils.get(guild.categories, name=VIS_CATEGORY_NAME)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        moderator_role: discord.PermissionOverwrite(
+            view_channel=True, read_message_history=True, send_messages=False
+        ),
+    }
+    if guild.me is not None:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True, read_message_history=True, send_messages=True,
+            manage_messages=True, manage_channels=True,
+        )
+    if category is None:
+        category = await guild.create_category(VIS_CATEGORY_NAME, overwrites=overwrites, reason="VIS карточки игроков")
+    else:
+        await category.edit(overwrites=overwrites, reason="VIS права категории модераторов")
+    cfg["category_id"] = category.id
+    store.save()
+    return category
+
+
+async def update_vis_card_message(channel: discord.TextChannel, message_id: int,
+                                  embed: discord.Embed) -> int:
+    if message_id:
+        try:
+            message = channel.get_partial_message(message_id)
+            await message.edit(content=None, embed=embed, allowed_mentions=NO_PINGS)
+            return message_id
+        except discord.NotFound:
+            pass
+    message = await channel.send(embed=embed, allowed_mentions=NO_PINGS)
+    return message.id
+
+
+async def synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
+    cfg = vis_config(guild.id)
+    roster = moderator_roster(guild.id)
+    if cfg is None:
+        raise RuntimeError("Сначала настрой /vis.")
+    if roster is None:
+        raise RuntimeError("Сначала настрой карточки модераторов.")
+    moderator_role_id = int(roster.get("moderator_role_id") or 0)
+    moderator_role = guild.get_role(moderator_role_id) if moderator_role_id else None
+    if moderator_role is None:
+        raise RuntimeError("Сначала настрой /moderators_role.")
+    category = await ensure_vis_category(guild, cfg, moderator_role)
+    members = await fetch_all_members(guild)
+    blocks = [roster["blocks"][str(number)] for number in configured_moderator_blocks(roster)]
+    active_moderator_ids = {int(block.get("moderator_id") or 0) for block in blocks}
+    channels = cfg.setdefault("moderator_channels", {})
+    cards = cfg.setdefault("card_messages", {})
+
+    for moderator_id in list(channels):
+        if int(moderator_id) in active_moderator_ids:
+            continue
+        channel = guild.get_channel(int(channels.pop(moderator_id) or 0))
+        if isinstance(channel, discord.TextChannel) and channel.category_id == category.id:
+            try:
+                await channel.delete(reason="Модератор больше не назначен")
+            except discord.Forbidden:
+                pass
+        cards.pop(moderator_id, None)
+
+    total_cards = 0
+    for block in blocks:
+        moderator_id = int(block.get("moderator_id") or 0)
+        moderator = members.get(moderator_id)
+        if moderator is None:
+            continue
+        channel = guild.get_channel(int(channels.get(str(moderator_id), 0) or 0))
+        if not isinstance(channel, discord.TextChannel):
+            channel = await guild.create_text_channel(
+                vis_safe_channel_name(moderator), category=category,
+                reason="VIS канал модератора",
+            )
+            channels[str(moderator_id)] = channel.id
+        elif channel.category_id != category.id:
+            await channel.edit(category=category, sync_permissions=True, reason="VIS перенос канала")
+
+        player_ids = [int(uid) for uid in block.get("player_ids", [])]
+        moderator_cards = cards.setdefault(str(moderator_id), {})
+        for user_id in list(moderator_cards):
+            if int(user_id) in player_ids:
+                continue
+            message_id = int(moderator_cards.pop(user_id) or 0)
+            if message_id:
+                try:
+                    await channel.get_partial_message(message_id).delete()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+        for user_id in player_ids:
+            member = members.get(user_id)
+            if member is None:
+                continue
+            message_id = int(moderator_cards.get(str(user_id), 0) or 0)
+            moderator_cards[str(user_id)] = await update_vis_card_message(
+                channel, message_id, vis_player_embed(guild, member)
+            )
+            total_cards += 1
+        store.save()
+    return len(active_moderator_ids), total_cards
+
+
+async def process_hourly_vis_hubs(client: discord.Client):
+    now = dt.datetime.now(MAIN_VOICE_TZ)
+    slot = now.strftime("%Y-%m-%d-%H")
+    for guild in client.guilds:
+        cfg = vis_config(guild.id)
+        if cfg is None or cfg.get("last_hour_slot") == slot:
+            continue
+        cfg["last_hour_slot"] = slot
+        store.save()
+        try:
+            await synchronize_vis_hub(guild)
+        except Exception as e:
+            print(f"VIS почасовое обновление {guild.id}: {short_error(e)}", flush=True)
+
+
 def sync_member_name(member: discord.Member) -> str:
     return f"{member} ({member.id})"
 
@@ -2992,6 +3551,7 @@ class Bot(discord.Client):
             print(f"Ошибка учёта войса Мейн-приватки при запуске: {short_error(e)}", flush=True)
         in_voice = {str(m.id) for g in self.guilds for vc in g.voice_channels for m in vc.members if not m.bot}
         store.reconcile(in_voice)
+        reconcile_vis_voice(self)
         try:
             await import_wipes_from_sheet()
         except Exception as e:
@@ -3140,6 +3700,11 @@ class Bot(discord.Client):
         elif before.channel is not None and after.channel is None:
             store.voice_stop(uid)
 
+        if before.channel is None and after.channel is not None:
+            vis_voice_start(member.guild.id, member.id)
+        elif before.channel is not None and after.channel is None:
+            vis_voice_stop(member.guild.id, member.id)
+
         main_guild_id = cfg_id(ticket_sync_source_guild_key("main"))
         if main_guild_id and member.guild.id == main_guild_id:
             if before.channel is None and after.channel is not None:
@@ -3148,7 +3713,16 @@ class Bot(discord.Client):
                 store.main_voice_stop(uid)
 
     async def on_message(self, message):
-        if not use_editor() or message.author.bot or message.channel.id != editor_channel_id():
+        if message.author.bot:
+            return
+        if message.guild is not None:
+            cfg = vis_config(message.guild.id)
+            if cfg is not None:
+                if message.channel.id == int(cfg.get("farm_channel_id") or 0):
+                    asyncio.create_task(process_vis_farm_message(message))
+                elif message.channel.id in [int(cid) for cid in cfg.get("profile_channel_ids", [])]:
+                    asyncio.create_task(process_vis_profile_message(message))
+        if not use_editor() or message.channel.id != editor_channel_id():
             return
         try:
             await handle_editor_message(self, message)
@@ -3187,6 +3761,10 @@ class Bot(discord.Client):
             await process_scheduled_moderator_rosters(self)
         except Exception as e:
             print(f"Ошибка автосверки модераторов: {short_error(e)}", flush=True)
+        try:
+            await process_hourly_vis_hubs(self)
+        except Exception as e:
+            print(f"Ошибка почасового VIS: {short_error(e)}", flush=True)
 
     @wipe_tick.before_loop
     async def _wait(self):
@@ -4485,6 +5063,82 @@ async def moderators_unassigned(interaction: discord.Interaction):
         lines.extend(["", "Все нужные игроки распределены."])
     for chunk in chunk_lines(lines):
         await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+@bot.tree.command(name="vis", description="Настроить карточки игроков и анализ скриншотов фарма")
+@app_commands.describe(
+    farm_channel="Канал, куда игроки отправляют скриншоты фарма",
+    data_channel="Общий канал Steam, BattleMetrics, часового пояса и РТ",
+    steam_channel="Существующий отдельный канал со Steam",
+    battlemetrics_channel="Существующий отдельный канал BattleMetrics",
+    timezone_channel="Существующий отдельный канал часовых поясов",
+    positions_channel="Канал с известными позициями на РТ",
+    model="Vision-модель OpenRouter; пусто — модель из настроек сервера",
+)
+@app_commands.default_permissions(administrator=True)
+async def vis(
+    interaction: discord.Interaction,
+    farm_channel: discord.TextChannel,
+    data_channel: discord.TextChannel | None = None,
+    steam_channel: discord.TextChannel | None = None,
+    battlemetrics_channel: discord.TextChannel | None = None,
+    timezone_channel: discord.TextChannel | None = None,
+    positions_channel: discord.TextChannel | None = None,
+    model: str | None = None,
+):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("moderator_role_id") or 0):
+        await interaction.response.send_message(
+            "Сначала настрой общую роль модераторов через `/moderators_role`.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    cfg = vis_config(interaction.guild.id, create=True)
+    cfg["farm_channel_id"] = farm_channel.id
+    channel_types = {}
+    for channel, source_type in (
+        (data_channel, "data"),
+        (steam_channel, "steam"),
+        (battlemetrics_channel, "battlemetrics"),
+        (timezone_channel, "timezone"),
+        (positions_channel, "positions"),
+    ):
+        if channel is not None and channel.id != farm_channel.id:
+            channel_types[str(channel.id)] = source_type
+    selected_channels = [int(channel_id) for channel_id in channel_types]
+    if selected_channels:
+        cfg["profile_channel_ids"] = selected_channels
+        cfg["profile_channel_types"] = channel_types
+    if model and model.strip():
+        cfg["model"] = model.strip()[:150]
+    cfg["last_hour_slot"] = ""
+    store.save()
+    try:
+        await interaction.edit_original_response(content="Импортирую существующие Steam и BattleMetrics…")
+        imported = await scan_vis_profile_history(interaction.guild, cfg)
+        await interaction.edit_original_response(content="Создаю категорию и карточки игроков…")
+        moderators_count, cards_count = await synchronize_vis_hub(interaction.guild)
+    except Exception as e:
+        await interaction.edit_original_response(content=f"Не удалось завершить настройку: {short_error(e)}")
+        return
+    key_status = "настроен" if OPENROUTER_KEY else "не настроен — скриншоты пока не анализируются"
+    await interaction.edit_original_response(
+        content=(
+            "VIS настроен.\n"
+            f"Канал фарма: {farm_channel.mention}\n"
+            f"Импортировано сообщений с данными: **{imported}**\n"
+            f"Каналов модераторов: **{moderators_count}**\n"
+            f"Карточек игроков: **{cards_count}**\n"
+            f"OpenRouter: **{key_status}**\n"
+            "Карточки обновляются каждый час. В канале фарма бот работает полностью тихо."
+        ),
+        allowed_mentions=NO_PINGS,
+    )
 
 
 @bot.tree.command(name="moderators_set", description="Вручную назначить модератора карточке")
