@@ -4411,6 +4411,69 @@ async def moderators_sync(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="moderators_unassigned", description="Показать незакреплённых игроков приватки")
+@app_commands.default_permissions(administrator=True)
+async def moderators_unassigned(interaction: discord.Interaction):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    if not MEMBERS_OK:
+        await interaction.response.send_message(
+            "Включи Server Members Intent в Discord Developer Portal и перезапусти бота.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        members = await fetch_all_members(interaction.guild)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Не удалось получить участников: {short_error(e)}", ephemeral=True
+        )
+        return
+    moderator_ids = {
+        member.id for member in members.values()
+        if member_has_roster_moderator_role(member, roster)
+    }
+    excluded_ids = {
+        member.id for member in members.values()
+        if member.id not in moderator_ids and member_is_moderator_excluded(member, roster)
+    }
+    assigned_ids = {
+        int(uid)
+        for block in roster.get("blocks", {}).values()
+        for uid in block.get("player_ids", [])
+    }
+    eligible = {
+        member.id: member for member in members.values()
+        if member.id not in moderator_ids and member.id not in excluded_ids
+    }
+    missing = sorted(
+        (member for uid, member in eligible.items() if uid not in assigned_ids),
+        key=lambda member: (member.display_name.casefold(), member.id),
+    )
+    lines = [
+        "**Проверка распределения приватки**",
+        f"Участников без ботов: **{len(members)}**",
+        f"Модераторов: **{len(moderator_ids)}**",
+        f"По ролям-исключениям: **{len(excluded_ids)}**",
+        f"Должны быть распределены: **{len(eligible)}**",
+        f"Не распределены: **{len(missing)}**",
+    ]
+    if missing:
+        lines.extend(["", "**Нужно распределить:**"])
+        lines.extend(f"• {member.mention} (`{member.id}`)" for member in missing)
+    else:
+        lines.extend(["", "Все нужные игроки распределены."])
+    for chunk in chunk_lines(lines):
+        await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
 @bot.tree.command(name="moderators_set", description="Вручную назначить модератора карточке")
 @app_commands.describe(slot="Номер карточки", moderator="Модератор этой карточки")
 @app_commands.default_permissions(administrator=True)
