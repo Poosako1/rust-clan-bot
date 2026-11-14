@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 70133)
-Total output lines: 5797
+Warning: truncated output (original token count: 70270)
+Total output lines: 5806
 
 import os
 import re
@@ -2944,15 +2944,7 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …133 tokens truncated…", "stone", "wood", "cupboards")}
-        if not any(values.values()):
-            print(f"VIS фарм: на сообщении {message.id} ресурсы не распознаны", flush=True)
-            return
-        vis_add_farm(message.guild.id, member.id, values)
-        for image_hash in new_hashes:
-            seen[image_hash] = time.time()
-        store.save()
-        await refresh_vis_player_card(message.guild, member.id)
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …270 tokens truncated…рточка не обновилась: {short_error(e)}", flush=True)
     except Exception as e:
         print(f"VIS фарм {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
 
@@ -2984,7 +2976,10 @@ async def process_vis_profile_message(message: discord.Message):
         return
     changed = vis_apply_profile_fields(message.guild.id, member.id, fields)
     if changed:
-        await refresh_vis_player_card(message.guild, member.id)
+        try:
+            await refresh_vis_player_card(message.guild, member.id)
+        except Exception as e:
+            print(f"VIS: профиль сохранён, но карточка не обновилась: {short_error(e)}", flush=True)
     try:
         await message.delete()
         confirmation = await message.channel.send(
@@ -3130,16 +3125,19 @@ async def refresh_vis_player_card(guild: discord.Guild, user_id: int) -> bool:
                     safe_name = discord.utils.escape_markdown(
                         discord.utils.escape_mentions(member.display_name)
                     )
-                    alert = await channel.send(
-                        f"{moderator.mention} В карточке игрока **{safe_name}** есть изменения.",
-                        allowed_mentions=discord.AllowedMentions(
-                            users=[moderator], roles=False, everyone=False
-                        ),
-                    )
-                    alerts[str(moderator_id)] = alert.id
+                    try:
+                        alert = await channel.send(
+                            f"{moderator.mention} В карточке игрока **{safe_name}** есть изменения.",
+                            allowed_mentions=discord.AllowedMentions(
+                                users=True, roles=False, everyone=False
+                            ),
+                        )
+                        alerts[str(moderator_id)] = alert.id
+                    except Exception as e:
+                        print(f"VIS уведомление модератора {moderator_id}: {short_error(e)}", flush=True)
                 store.save()
                 return True
-            except (discord.Forbidden, discord.HTTPException) as e:
+            except Exception as e:
                 print(f"VIS карточка игрока {guild.id}/{user_id}: {short_error(e)}", flush=True)
                 return False
     return False
