@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 70133)
+Total output lines: 5797
+
 import os
 import re
 import secrets
@@ -2636,6 +2639,7 @@ def vis_config(guild_id: int, create: bool = False) -> dict | None:
             "category_id": 0,
             "moderator_channels": {},
             "card_messages": {},
+            "last_change_alerts": {},
             "model": VISION_MODEL,
             "last_hour_slot": "",
         }
@@ -2648,6 +2652,7 @@ def vis_config(guild_id: int, create: bool = False) -> dict | None:
     cfg.setdefault("category_id", 0)
     cfg.setdefault("moderator_channels", {})
     cfg.setdefault("card_messages", {})
+    cfg.setdefault("last_change_alerts", {})
     cfg.setdefault("model", VISION_MODEL)
     cfg.setdefault("last_hour_slot", "")
     return cfg
@@ -2939,13 +2944,7 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа к wood: "
-        "код сделает это сам как 1000 дерева за каждый шкаф. Если ресурс не виден, ставь 0. "
-        "Не угадывай скрытые значения и не считай один предмет дважды на нескольких скриншотах."
-    )
-    try:
-        result = await vis_openrouter_json(str(cfg.get("model") or VISION_MODEL), image_parts, prompt)
-        values = {key: vis_number(result.get(key)) for key in ("sulfur", "metal", "stone", "wood", "cupboards")}
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …133 tokens truncated…", "stone", "wood", "cupboards")}
         if not any(values.values()):
             print(f"VIS фарм: на сообщении {message.id} ресурсы не распознаны", flush=True)
             return
@@ -2983,8 +2982,9 @@ async def process_vis_profile_message(message: discord.Message):
             print(f"VIS профиль {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
     if not any(str(value or "").strip() for value in fields.values()):
         return
-    vis_apply_profile_fields(message.guild.id, member.id, fields)
-    await refresh_vis_player_card(message.guild, member.id)
+    changed = vis_apply_profile_fields(message.guild.id, member.id, fields)
+    if changed:
+        await refresh_vis_player_card(message.guild, member.id)
     try:
         await message.delete()
         confirmation = await message.channel.send(
@@ -3118,6 +3118,25 @@ async def refresh_vis_player_card(guild: discord.Guild, user_id: int) -> bool:
                 player_cards[str(user_id)] = await update_vis_card_message(
                     channel, message_id, vis_player_embed(guild, member)
                 )
+                alerts = cfg.setdefault("last_change_alerts", {})
+                previous_alert_id = int(alerts.get(str(moderator_id), 0) or 0)
+                if previous_alert_id:
+                    try:
+                        await channel.get_partial_message(previous_alert_id).delete()
+                    except (discord.NotFound, discord.Forbidden):
+                        pass
+                moderator = guild.get_member(int(moderator_id))
+                if moderator is not None:
+                    safe_name = discord.utils.escape_markdown(
+                        discord.utils.escape_mentions(member.display_name)
+                    )
+                    alert = await channel.send(
+                        f"{moderator.mention} В карточке игрока **{safe_name}** есть изменения.",
+                        allowed_mentions=discord.AllowedMentions(
+                            users=[moderator], roles=False, everyone=False
+                        ),
+                    )
+                    alerts[str(moderator_id)] = alert.id
                 store.save()
                 return True
             except (discord.Forbidden, discord.HTTPException) as e:
@@ -3154,6 +3173,7 @@ async def _synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
             except discord.Forbidden:
                 pass
         cards.pop(moderator_id, None)
+        cfg.setdefault("last_change_alerts", {}).pop(moderator_id, None)
 
     total_cards = 0
     for block in blocks:
