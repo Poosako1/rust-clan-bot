@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 71256)
-Total output lines: 5878
+Warning: truncated output (original token count: 71387)
+Total output lines: 5888
 
 import os
 import re
@@ -2944,18 +2944,7 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1256 tokens truncated…lour=0x7C3AED,
-    )
-    steam_id_match = re.search(r"steamcommunity\.com/profiles/(\d+)", steam)
-    if steam.startswith("http"):
-        steam_label = steam_id_match.group(1) if steam_id_match else "Открыть профиль"
-        steam_value = f"[{steam_label}]({steam})"
-    else:
-        steam_value = steam
-    embed.add_field(name="Steam", value=steam_value, inline=True)
-    embed.add_field(
-        name="BattleMetrics",
-        value=f"[Открыть профиль]({battlemetrics})" if battlemetrics.startswith("http") else battlemetrics,
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1387 tokens truncated…tswith("http") else battlemetrics,
         inline=True,
     )
     embed.add_field(name="Часовой пояс", value=timezone, inline=True)
@@ -5247,21 +5236,29 @@ async def vis(
     )
 
 
-@bot.tree.command(name="vis_sync", description="Заново создать каналы модераторов и обновить VIS-карточки")
+@bot.tree.command(name="vis_sync", description="Подключить текущий канал, прочитать историю и обновить карточки")
 @app_commands.default_permissions(administrator=True)
 async def vis_sync(interaction: discord.Interaction):
     if not await admin_only(interaction):
         return
-    if interaction.guild is None:
-        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Запусти команду прямо в нужном текстовом канале.", ephemeral=True
+        )
         return
-    if vis_config(interaction.guild.id) is None:
-        await interaction.response.send_message("Сначала настрой систему через `/vis`.", ephemeral=True)
-        return
+    cfg = vis_config(interaction.guild.id, create=True)
     await interaction.response.defer(ephemeral=True)
+    channel = interaction.channel
+    channel_ids = [int(cid) for cid in cfg.get("profile_channel_ids", [])]
+    if channel.id not in channel_ids:
+        channel_ids.append(channel.id)
+    cfg["profile_channel_ids"] = channel_ids
+    cfg.setdefault("profile_channel_types", {})[str(channel.id)] = "data"
+    store.save()
     try:
-        cfg = vis_config(interaction.guild.id)
-        imported = await scan_vis_profile_history(interaction.guild, cfg)
+        imported = await scan_vis_profile_history(
+            interaction.guild, cfg, channel_ids=[channel.id]
+        )
         moderators_count, cards_count = await synchronize_vis_hub(interaction.guild)
     except Exception as e:
         await interaction.followup.send(
@@ -5269,8 +5266,10 @@ async def vis_sync(interaction: discord.Interaction):
         )
         return
     await interaction.followup.send(
-        f"VIS восстановлен. Каналов модераторов: **{moderators_count}**, "
-        f"карточек игроков: **{cards_count}**, импортировано записей: **{imported}**.",
+        f"Канал {channel.mention} подключён. Прочитана вся история, импортировано записей: "
+        f"**{imported}**. Каналов модераторов: **{moderators_count}**, "
+        f"карточек игроков: **{cards_count}**. Все новые сообщения из этого канала "
+        "теперь обрабатываются автоматически.",
         ephemeral=True,
     )
 
