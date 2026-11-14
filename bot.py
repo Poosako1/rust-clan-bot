@@ -2305,23 +2305,37 @@ def moderator_roster(guild_id: int, create: bool = False) -> dict | None:
     return roster
 
 
-def moderator_block_text(number: int, block: dict) -> str:
+def moderator_block_embed(number: int, block: dict) -> discord.Embed:
     moderator_id = int(block.get("moderator_id") or 0)
     player_ids = [int(uid) for uid in block.get("player_ids", []) if int(uid)]
     moderator_text = f"<@{moderator_id}> (`{moderator_id}`)" if moderator_id else "*не назначен*"
+    embed = discord.Embed(
+        title=f"Блок {number:02d}",
+        description=f"**Модератор**\n{moderator_text}",
+        colour=0x7C3AED,
+    )
     lines = [
-        f"## Блок {number}",
-        f"**Модератор:** {moderator_text}",
-        f"**Игроки: {len(player_ids)}**",
+        f"**{index:02d}.** <@{uid}>  ·  `{uid}`"
+        for index, uid in enumerate(player_ids, 1)
     ]
-    if player_ids:
-        lines.extend(
-            f"{index}. <@{uid}> (`{uid}`)"
-            for index, uid in enumerate(player_ids, 1)
-        )
+    if not lines:
+        embed.add_field(name="Игроки · 0", value="*Игроков пока нет.*", inline=False)
     else:
-        lines.append("*Игроков пока нет.*")
-    return "\n".join(lines)
+        chunks, current = [], []
+        current_size = 0
+        for line in lines:
+            if current and current_size + len(line) + 1 > 1000:
+                chunks.append("\n".join(current))
+                current, current_size = [], 0
+            current.append(line)
+            current_size += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+        for index, chunk in enumerate(chunks):
+            name = f"Игроки · {len(player_ids)}" if index == 0 else "Продолжение"
+            embed.add_field(name=name, value=chunk, inline=False)
+    embed.set_footer(text="CL Team · контроль состава")
+    return embed
 
 
 async def moderator_roster_channel(guild: discord.Guild, roster: dict) -> discord.TextChannel | None:
@@ -2345,13 +2359,13 @@ async def update_moderator_block(guild: discord.Guild, number: int, roster: dict
             message = await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden):
             message = None
-    content = moderator_block_text(number, block)
+    embed = moderator_block_embed(number, block)
     if message is None:
-        message = await channel.send(content, allowed_mentions=NO_PINGS)
+        message = await channel.send(embed=embed, allowed_mentions=NO_PINGS)
         block["message_id"] = message.id
         store.save()
     else:
-        await message.edit(content=content, allowed_mentions=NO_PINGS)
+        await message.edit(content=None, embed=embed, allowed_mentions=NO_PINGS)
 
 
 async def update_all_moderator_blocks(guild: discord.Guild, roster: dict | None = None):
