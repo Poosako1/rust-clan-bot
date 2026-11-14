@@ -2953,6 +2953,7 @@ async def process_vis_farm_message(message: discord.Message):
         for image_hash in new_hashes:
             seen[image_hash] = time.time()
         store.save()
+        await refresh_vis_player_card(message.guild, member.id)
     except Exception as e:
         print(f"VIS фарм {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
 
@@ -2983,6 +2984,7 @@ async def process_vis_profile_message(message: discord.Message):
     if not any(str(value or "").strip() for value in fields.values()):
         return
     vis_apply_profile_fields(message.guild.id, member.id, fields)
+    await refresh_vis_player_card(message.guild, member.id)
     try:
         await message.delete()
         confirmation = await message.channel.send(
@@ -3094,6 +3096,34 @@ async def update_vis_card_message(channel: discord.TextChannel, message_id: int,
             pass
     message = await channel.send(embed=embed, allowed_mentions=NO_PINGS)
     return message.id
+
+
+async def refresh_vis_player_card(guild: discord.Guild, user_id: int) -> bool:
+    """Точечно обновить карточку игрока после изменения профиля или фарма."""
+    cfg = vis_config(guild.id)
+    member = guild.get_member(user_id)
+    if cfg is None or member is None:
+        return False
+    lock = VIS_HUB_LOCKS.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        for moderator_id, player_cards in cfg.get("card_messages", {}).items():
+            message_id = int(player_cards.get(str(user_id), 0) or 0)
+            if not message_id:
+                continue
+            channel_id = int(cfg.get("moderator_channels", {}).get(str(moderator_id), 0) or 0)
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                player_cards[str(user_id)] = await update_vis_card_message(
+                    channel, message_id, vis_player_embed(guild, member)
+                )
+                store.save()
+                return True
+            except (discord.Forbidden, discord.HTTPException) as e:
+                print(f"VIS карточка игрока {guild.id}/{user_id}: {short_error(e)}", flush=True)
+                return False
+    return False
 
 
 async def _synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
