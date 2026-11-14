@@ -2613,10 +2613,15 @@ async def process_scheduled_moderator_rosters(client: discord.Client):
 
 # ---------- VIS: карточки игроков в каналах модераторов ----------
 VIS_CATEGORY_NAME = "MODERATORS"
+VIS_HUB_LOCKS: dict[int, asyncio.Lock] = {}
 STEAM_RE = re.compile(
     r"https?://(?:www\.)?steamcommunity\.com/(?:profiles/\d+|id/[A-Za-z0-9_-]+)/?",
     re.I,
 )
+STEAM64_RE = re.compile(r"\b(7656119\d{10})\b")
+STEAM_LEGACY_RE = re.compile(r"\bSTEAM_[0-5]:([01]):(\d+)\b", re.I)
+STEAM_ACCOUNT_RE = re.compile(r"\[U:1:(\d+)\]", re.I)
+STEAM64_BASE = 76561197960265728
 BM_RE = re.compile(r"https?://(?:www\.)?battlemetrics\.com/players/\d+/?", re.I)
 
 
@@ -2724,12 +2729,29 @@ def vis_target_member(message: discord.Message) -> discord.Member | None:
     return mentioned or (message.author if isinstance(message.author, discord.Member) and not message.author.bot else None)
 
 
+def vis_steam_profile_from_text(text: str) -> str:
+    steam = STEAM_RE.search(text)
+    if steam:
+        return steam.group(0).rstrip("/")
+    steam64 = STEAM64_RE.search(text)
+    if steam64:
+        return f"https://steamcommunity.com/profiles/{steam64.group(1)}"
+    legacy = STEAM_LEGACY_RE.search(text)
+    if legacy:
+        account_id = int(legacy.group(2)) * 2 + int(legacy.group(1))
+        return f"https://steamcommunity.com/profiles/{STEAM64_BASE + account_id}"
+    account = STEAM_ACCOUNT_RE.search(text)
+    if account:
+        return f"https://steamcommunity.com/profiles/{STEAM64_BASE + int(account.group(1))}"
+    return ""
+
+
 def vis_extract_profile_fields(text: str, source_type: str = "data") -> dict[str, str]:
     out: dict[str, str] = {}
-    steam = STEAM_RE.search(text)
+    steam = vis_steam_profile_from_text(text)
     battlemetrics = BM_RE.search(text)
     if steam:
-        out["steam"] = steam.group(0).rstrip("/")
+        out["steam"] = steam
     if battlemetrics:
         out["battlemetrics"] = battlemetrics.group(0).rstrip("/")
     timezone_match = re.search(
@@ -2773,6 +2795,8 @@ def vis_apply_profile_fields(guild_id: int, user_id: int, fields: dict[str, str]
     changed = False
     for key in ("steam", "battlemetrics", "timezone", "rt_positions"):
         value = clean.get(key)
+        if key == "steam" and value:
+            value = vis_steam_profile_from_text(value) or value
         if value and profile.get(key) != value:
             profile[key] = value
             changed = True
@@ -2972,11 +2996,13 @@ def vis_player_embed(guild: discord.Guild, member: discord.Member) -> discord.Em
         description=f"{member.mention}\nВ приватке: **{days} дн.**",
         colour=0x7C3AED,
     )
-    embed.add_field(
-        name="Steam",
-        value=f"[Открыть профиль]({steam})" if steam.startswith("http") else steam,
-        inline=True,
-    )
+    steam_id_match = re.search(r"steamcommunity\.com/profiles/(\d+)", steam)
+    if steam.startswith("http"):
+        steam_label = steam_id_match.group(1) if steam_id_match else "Открыть профиль"
+        steam_value = f"[{steam_label}]({steam})"
+    else:
+        steam_value = steam
+    embed.add_field(name="Steam", value=steam_value, inline=True)
     embed.add_field(
         name="BattleMetrics",
         value=f"[Открыть профиль]({battlemetrics})" if battlemetrics.startswith("http") else battlemetrics,
@@ -3053,7 +3079,7 @@ async def update_vis_card_message(channel: discord.TextChannel, message_id: int,
     return message.id
 
 
-async def synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
+async def _synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
     cfg = vis_config(guild.id)
     roster = moderator_roster(guild.id)
     if cfg is None:
@@ -3100,6 +3126,38 @@ async def synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
 
         player_ids = [int(uid) for uid in block.get("player_ids", [])]
         moderator_cards = cards.setdefault(str(moderator_id), {})
+        detected_cards: dict[int, list[discord.Message]] = {}
+        async for existing_message in channel.history(limit=500):
+            if existing_message.author.id != guild.me.id or not existing_message.embeds:
+                continue
+            description = existing_message.embeds[0].description or ""
+            if "В приватке:" not in description:
+                continue
+            match = re.search(r"<@!?(\d+)>", description)
+            if match:
+                detected_cards.setdefault(int(match.group(1)), []).append(existing_message)
+
+        for detected_user_id, messages in detected_cards.items():
+            if detected_user_id not in player_ids:
+                for duplicate in messages:
+                    try:
+                        await duplicate.delete()
+                    except discord.Forbidden:
+                        pass
+                moderator_cards.pop(str(detected_user_id), None)
+                continue
+            saved_id = int(moderator_cards.get(str(detected_user_id), 0) or 0)
+            keep = next((message for message in messages if message.id == saved_id), None)
+            if keep is None:
+                keep = messages[-1]
+                moderator_cards[str(detected_user_id)] = keep.id
+            for duplicate in messages:
+                if duplicate.id == keep.id:
+                    continue
+                try:
+                    await duplicate.delete()
+                except discord.Forbidden:
+                    pass
         for user_id in list(moderator_cards):
             if int(user_id) in player_ids:
                 continue
@@ -3120,6 +3178,12 @@ async def synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
             total_cards += 1
         store.save()
     return len(active_moderator_ids), total_cards
+
+
+async def synchronize_vis_hub(guild: discord.Guild) -> tuple[int, int]:
+    lock = VIS_HUB_LOCKS.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        return await _synchronize_vis_hub(guild)
 
 
 async def process_hourly_vis_hubs(client: discord.Client):
@@ -4996,8 +5060,15 @@ async def moderators_sync(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Не удалось выполнить сверку: {short_error(e)}", ephemeral=True)
         return
+    vis_text = ""
+    if vis_config(interaction.guild.id) is not None:
+        try:
+            _, vis_cards = await synchronize_vis_hub(interaction.guild)
+            vis_text = f" VIS-карточек обновлено: **{vis_cards}**."
+        except Exception as e:
+            vis_text = f" VIS-карточки не обновились: {short_error(e)}."
     await interaction.followup.send(
-        f"Сверка завершена. Модераторов: **{moderators_count}**, игроков: **{players_count}**.",
+        f"Сверка завершена. Модераторов: **{moderators_count}**, игроков: **{players_count}**.{vis_text}",
         ephemeral=True,
     )
 
