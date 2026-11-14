@@ -2980,8 +2980,9 @@ async def process_vis_profile_message(message: discord.Message):
             )}
         except Exception as e:
             print(f"VIS профиль {message.guild.id}/{message.id}: {short_error(e)}", flush=True)
-    if not vis_apply_profile_fields(message.guild.id, member.id, fields):
+    if not any(str(value or "").strip() for value in fields.values()):
         return
+    vis_apply_profile_fields(message.guild.id, member.id, fields)
     try:
         await message.delete()
         confirmation = await message.channel.send(
