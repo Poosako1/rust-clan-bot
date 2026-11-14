@@ -2334,7 +2334,7 @@ def moderator_block_embed(number: int, block: dict) -> discord.Embed:
         for index, chunk in enumerate(chunks):
             name = f"Игроки · {len(player_ids)}" if index == 0 else "Продолжение"
             embed.add_field(name=name, value=chunk, inline=False)
-    embed.set_footer(text="CL Team · контроль состава")
+    embed.set_footer(text="CL Team")
     return embed
 
 
