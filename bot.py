@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 71211)
-Total output lines: 5876
+Warning: truncated output (original token count: 71256)
+Total output lines: 5878
 
 import os
 import re
@@ -2944,11 +2944,7 @@ async def process_vis_farm_message(message: discord.Message):
     prompt = (
         "Проанализируй скриншоты Rust и посчитай только явно видимые количества ресурсов. "
         "Верни JSON с целыми числами: sulfur, metal, stone, wood, cupboards. "
-        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1211 tokens truncated…") or "не указаны"
-    embed = discord.Embed(
-        title=member.display_name,
-        description=f"{member.mention}\nВ приватке: **{days} дн.**",
-        colour=0x7C3AED,
+        "cupboards — количество предметов Tool Cupboard/шкаф. Не добавляй стоимость шкафа …1256 tokens truncated…lour=0x7C3AED,
     )
     steam_id_match = re.search(r"steamcommunity\.com/profiles/(\d+)", steam)
     if steam.startswith("http"):
@@ -5264,6 +5260,8 @@ async def vis_sync(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     try:
+        cfg = vis_config(interaction.guild.id)
+        imported = await scan_vis_profile_history(interaction.guild, cfg)
         moderators_count, cards_count = await synchronize_vis_hub(interaction.guild)
     except Exception as e:
         await interaction.followup.send(
@@ -5272,7 +5270,7 @@ async def vis_sync(interaction: discord.Interaction):
         return
     await interaction.followup.send(
         f"VIS восстановлен. Каналов модераторов: **{moderators_count}**, "
-        f"карточек игроков: **{cards_count}**.",
+        f"карточек игроков: **{cards_count}**, импортировано записей: **{imported}**.",
         ephemeral=True,
     )
 
