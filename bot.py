@@ -2623,6 +2623,7 @@ STEAM_LEGACY_RE = re.compile(r"\bSTEAM_[0-5]:([01]):(\d+)\b", re.I)
 STEAM_ACCOUNT_RE = re.compile(r"\[U:1:(\d+)\]", re.I)
 STEAM64_BASE = 76561197960265728
 BM_RE = re.compile(r"https?://(?:www\.)?battlemetrics\.com/players/\d+/?", re.I)
+BM_ID_RE = re.compile(r"(?:battlemetrics|battle\s*metrics|бм|бмс)\s*[:#=-]?\s*(\d{5,15})", re.I)
 
 
 def vis_config(guild_id: int, create: bool = False) -> dict | None:
@@ -2746,14 +2747,24 @@ def vis_steam_profile_from_text(text: str) -> str:
     return ""
 
 
+def vis_battlemetrics_profile_from_text(text: str) -> str:
+    battlemetrics = BM_RE.search(text)
+    if battlemetrics:
+        return battlemetrics.group(0).rstrip("/")
+    battlemetrics_id = BM_ID_RE.search(text)
+    if battlemetrics_id:
+        return f"https://www.battlemetrics.com/players/{battlemetrics_id.group(1)}"
+    return ""
+
+
 def vis_extract_profile_fields(text: str, source_type: str = "data") -> dict[str, str]:
     out: dict[str, str] = {}
     steam = vis_steam_profile_from_text(text)
-    battlemetrics = BM_RE.search(text)
+    battlemetrics = vis_battlemetrics_profile_from_text(text)
     if steam:
         out["steam"] = steam
     if battlemetrics:
-        out["battlemetrics"] = battlemetrics.group(0).rstrip("/")
+        out["battlemetrics"] = battlemetrics
     timezone_match = re.search(
         r"(?:(?:часов(?:ой|ого)\s+пояс\w*|utc|gmt|мск)\s*[:=]?\s*)([+-]?\s*\d{1,2})",
         text,
@@ -2797,6 +2808,8 @@ def vis_apply_profile_fields(guild_id: int, user_id: int, fields: dict[str, str]
         value = clean.get(key)
         if key == "steam" and value:
             value = vis_steam_profile_from_text(value) or value
+        if key == "battlemetrics" and value:
+            value = vis_battlemetrics_profile_from_text(value) or value
         if value and profile.get(key) != value:
             profile[key] = value
             changed = True
@@ -2971,7 +2984,10 @@ async def process_vis_profile_message(message: discord.Message):
         return
     try:
         await message.delete()
-        confirmation = await message.channel.send("✅ Ответ записан", allowed_mentions=NO_PINGS)
+        confirmation = await message.channel.send(
+            f"{member.mention} ✅ Ответ записан",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
         await confirmation.delete(delay=5)
     except discord.Forbidden:
         print(f"VIS: нет права удалять сообщения в канале {message.channel.id}", flush=True)
