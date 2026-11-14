@@ -5060,17 +5060,8 @@ async def moderators_sync(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Не удалось выполнить сверку: {short_error(e)}", ephemeral=True)
         return
-    vis_text = ""
-    current_vis_config = vis_config(interaction.guild.id)
-    if current_vis_config is not None:
-        try:
-            imported = await scan_vis_profile_history(interaction.guild, current_vis_config)
-            _, vis_cards = await synchronize_vis_hub(interaction.guild)
-            vis_text = f" VIS-карточек обновлено: **{vis_cards}**, импортировано данных: **{imported}**."
-        except Exception as e:
-            vis_text = f" VIS-карточки не обновились: {short_error(e)}."
     await interaction.followup.send(
-        f"Сверка завершена. Модераторов: **{moderators_count}**, игроков: **{players_count}**.{vis_text}",
+        f"Сверка завершена. Модераторов: **{moderators_count}**, игроков: **{players_count}**.",
         ephemeral=True,
     )
 
