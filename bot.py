@@ -2280,6 +2280,7 @@ def moderator_roster(guild_id: int, create: bool = False) -> dict | None:
         store.moderator_rosters[key] = {
             "channel_id": 0,
             "last_alert_message_id": 0,
+            "excluded_role_ids": [],
             "blocks": {
                 str(number): {
                     "moderator_id": 0,
@@ -2300,6 +2301,7 @@ def moderator_roster(guild_id: int, create: bool = False) -> dict | None:
         block.setdefault("message_id", 0)
     roster.setdefault("channel_id", 0)
     roster.setdefault("last_alert_message_id", 0)
+    roster.setdefault("excluded_role_ids", [])
     return roster
 
 
@@ -2394,6 +2396,11 @@ def configured_moderator_blocks(roster: dict) -> list[int]:
     ]
 
 
+def member_is_moderator_excluded(member: discord.Member, roster: dict) -> bool:
+    excluded_role_ids = {int(role_id) for role_id in roster.get("excluded_role_ids", [])}
+    return any(role.id in excluded_role_ids for role in member.roles)
+
+
 async def auto_assign_moderator_player(member: discord.Member) -> bool:
     roster = moderator_roster(member.guild.id)
     if roster is None or not int(roster.get("channel_id") or 0):
@@ -2406,7 +2413,7 @@ async def auto_assign_moderator_player(member: discord.Member) -> bool:
             int(roster["blocks"][str(number)].get("moderator_id") or 0)
             for number in blocks
         }
-        if not blocks or member.id in moderator_ids:
+        if not blocks or member.id in moderator_ids or member_is_moderator_excluded(member, roster):
             return False
         number = min(
             blocks,
@@ -2894,6 +2901,33 @@ class Bot(discord.Client):
             await remove_departed_moderator_player(member)
         except Exception as e:
             print(f"Не удалось убрать вышедшего игрока из блока модератора: {short_error(e)}", flush=True)
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if after.bot or before.roles == after.roles:
+            return
+        roster = moderator_roster(after.guild.id)
+        if roster is None:
+            return
+        was_excluded = member_is_moderator_excluded(before, roster)
+        is_excluded = member_is_moderator_excluded(after, roster)
+        if was_excluded == is_excluded:
+            return
+        try:
+            if is_excluded:
+                async with moderator_roster_lock(after.guild.id):
+                    number = find_moderator_player_block(roster, after.id)
+                    if number is None:
+                        return
+                    block = roster["blocks"][str(number)]
+                    block["player_ids"] = [
+                        uid for uid in block.get("player_ids", []) if int(uid) != after.id
+                    ]
+                    store.save()
+                    await update_moderator_block(after.guild, number, roster)
+            else:
+                await auto_assign_moderator_player(after)
+        except Exception as e:
+            print(f"Не удалось применить исключение модераторов: {short_error(e)}", flush=True)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         removed = [
@@ -4294,7 +4328,11 @@ async def moderators_distribute(interaction: discord.Interaction):
             int(roster["blocks"][str(number)].get("moderator_id") or 0) for number in blocks
         }
         players = sorted(
-            (member for member in members.values() if member.id not in moderator_ids),
+            (
+                member for member in members.values()
+                if member.id not in moderator_ids
+                and not member_is_moderator_excluded(member, roster)
+            ),
             key=lambda member: (member.display_name.casefold(), member.id),
         )
         for block in roster["blocks"].values():
@@ -4312,6 +4350,75 @@ async def moderators_distribute(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="moderators_exclusions", description="Настроить роли, не участвующие в распределении")
+@app_commands.describe(
+    role_1="Первая исключённая роль, например Лидер",
+    role_2="Вторая исключённая роль, например Со-лидер",
+    role_3="Третья исключённая роль, например Старший админ",
+    clear="Удалить все сохранённые исключения",
+)
+@app_commands.default_permissions(administrator=True)
+async def moderators_exclusions(
+    interaction: discord.Interaction,
+    role_1: discord.Role | None = None,
+    role_2: discord.Role | None = None,
+    role_3: discord.Role | None = None,
+    clear: bool = False,
+):
+    if not await admin_only(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+    roster = moderator_roster(interaction.guild.id)
+    if roster is None or not int(roster.get("channel_id") or 0):
+        await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    selected_roles = list(dict.fromkeys(role for role in (role_1, role_2, role_3) if role is not None))
+    if any(role.is_default() for role in selected_roles):
+        await interaction.response.send_message("Роль @everyone исключать нельзя.", ephemeral=True)
+        return
+    if not clear and not selected_roles:
+        saved = [
+            interaction.guild.get_role(int(role_id))
+            for role_id in roster.get("excluded_role_ids", [])
+        ]
+        saved = [role for role in saved if role is not None]
+        text = ", ".join(role.mention for role in saved) if saved else "не настроены"
+        await interaction.response.send_message(
+            f"**Роли-исключения:** {text}", ephemeral=True, allowed_mentions=NO_PINGS
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with moderator_roster_lock(interaction.guild.id):
+        roster["excluded_role_ids"] = [] if clear else [role.id for role in selected_roles]
+        changed_blocks = []
+        removed = 0
+        if not clear:
+            for number in range(1, MODERATOR_BLOCK_COUNT + 1):
+                block = roster["blocks"][str(number)]
+                before_ids = list(block.get("player_ids", []))
+                keep_ids = []
+                for uid in before_ids:
+                    member = interaction.guild.get_member(int(uid))
+                    if member is not None and member_is_moderator_excluded(member, roster):
+                        removed += 1
+                    else:
+                        keep_ids.append(uid)
+                if keep_ids != before_ids:
+                    block["player_ids"] = keep_ids
+                    changed_blocks.append(number)
+        store.save()
+        for number in changed_blocks:
+            await update_moderator_block(interaction.guild, number, roster)
+    if clear:
+        result = "Все роли-исключения удалены."
+    else:
+        result = "Роли-исключения сохранены: " + ", ".join(role.mention for role in selected_roles)
+        result += f"\nУбрано из блоков: **{removed}**."
+    await interaction.followup.send(result, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
 @bot.tree.command(name="moderators_assign", description="Вручную закрепить игрока за нужным блоком")
 @app_commands.describe(player="Игрок", slot="Номер блока от 1 до 10")
 @app_commands.default_permissions(administrator=True)
@@ -4325,6 +4432,11 @@ async def moderators_assign(interaction: discord.Interaction, player: discord.Me
     roster = moderator_roster(interaction.guild.id)
     if roster is None or not int(roster.get("channel_id") or 0):
         await interaction.response.send_message("Сначала запусти `/moderators_setup`.", ephemeral=True)
+        return
+    if member_is_moderator_excluded(player, roster):
+        await interaction.response.send_message(
+            "У этого игрока есть роль-исключение, поэтому закрепить его нельзя.", ephemeral=True
+        )
         return
     target = roster["blocks"][str(slot)]
     moderator_id = int(target.get("moderator_id") or 0)
