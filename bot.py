@@ -2312,18 +2312,22 @@ def moderator_block_numbers(roster: dict) -> list[int]:
     return sorted(int(number) for number in roster.get("blocks", {}) if str(number).isdigit())
 
 
-def moderator_block_embed(number: int, block: dict) -> discord.Embed:
+def moderator_block_embed(guild: discord.Guild, number: int, block: dict) -> discord.Embed:
     moderator_id = int(block.get("moderator_id") or 0)
     player_ids = [int(uid) for uid in block.get("player_ids", []) if int(uid)]
-    moderator_text = f"<@{moderator_id}> (`{moderator_id}`)" if moderator_id else "*не назначен*"
+    moderator = guild.get_member(moderator_id) if moderator_id else None
+    moderator_text = moderator.mention if moderator is not None else "*не назначен*"
     embed = discord.Embed(
         description=f"**Модератор**\n{moderator_text}",
         colour=0x7C3AED,
     )
-    lines = [
-        f"**{index:02d}.** <@{uid}>  ·  `{uid}`"
-        for index, uid in enumerate(player_ids, 1)
-    ]
+    lines = []
+    for index, uid in enumerate(player_ids, 1):
+        member = guild.get_member(uid)
+        if member is not None:
+            lines.append(f"**{index:02d}.** {member.mention}")
+        else:
+            lines.append(f"**{index:02d}.** *участник не найден* (`{uid}`)")
     if not lines:
         embed.add_field(name="Игроки · 0", value="*Игроков пока нет.*", inline=False)
     else:
@@ -2365,7 +2369,7 @@ async def update_moderator_block(guild: discord.Guild, number: int, roster: dict
             message = await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden):
             message = None
-    embed = moderator_block_embed(number, block)
+    embed = moderator_block_embed(guild, number, block)
     if message is None:
         message = await channel.send(embed=embed, allowed_mentions=NO_PINGS)
         block["message_id"] = message.id
