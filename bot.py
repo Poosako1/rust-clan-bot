@@ -1029,7 +1029,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return is_staff_member(interaction.user)
 
 
-ROLES = ["коллер", "комбат", "билдер", "фермер", "электрик"]
+ROLES = ["коллер", "билдер", "фермер", "электрик"]
 
 
 def normalize_role(text: str) -> str | None:
@@ -1075,7 +1075,7 @@ class ProfileModal(SafeModal, title="Мой профиль"):
         label="Ваш BattleMetrics", placeholder="https://www.battlemetrics.com/players/123456789", max_length=200)
     region = discord.ui.TextInput(label="Регион", placeholder="Например: UA, EU, Москва", max_length=60)
     role = discord.ui.TextInput(
-        label="Твоя роль в клане", placeholder="коллер, комбат, билдер, фермер или электрик", max_length=30)
+        label="Твоя роль в клане", placeholder="коллер, билдер, фермер или электрик", max_length=30)
     payout = discord.ui.TextInput(
         label="Карта или номер для выплат", placeholder="Номер карты или телефона и банк", max_length=100)
 
@@ -1740,10 +1740,9 @@ TICKET_TYPES = {
     },
 }
 _ticket_locks: dict[str, asyncio.Lock] = {}
-TICKET_ROLES = ["коллер", "комбат", "fpv-пилот", "пилот", "крафтер", "электрик", "фермер", "билдер"]
+TICKET_ROLES = ["коллер", "fpv-пилот", "пилот", "крафтер", "электрик", "фермер", "билдер"]
 TICKET_ROLE_SLUGS = {
     "коллер": "coller",
-    "комбат": "combat",
     "fpv-пилот": "fpv",
     "пилот": "pilot",
     "крафтер": "crafter",
@@ -1753,7 +1752,6 @@ TICKET_ROLE_SLUGS = {
 }
 TICKET_SECOND_REQUIREMENTS = {
     "коллер": ("8к", 16),
-    "комбат": ("3к", 15),
     "fpv-пилот": ("2.5к", 15),
     "пилот": ("3к", 15),
     "крафтер": ("3к", 15),
@@ -1772,7 +1770,6 @@ TICKET_CLOSE_REASONS = {
 TICKET_ROLE_CONFIG_KEYS = {slug: f"ticket_role_{slug}" for slug in TICKET_ROLE_SLUGS.values()}
 TICKET_ROLE_LABELS = {
     "coller": "Коллер",
-    "combat": "Комбат",
     "fpv": "FPV-пилот",
     "pilot": "Пилот",
     "crafter": "Крафтер",
@@ -4250,7 +4247,7 @@ async def ticket_logs_setup(interaction: discord.Interaction):
 @bot.tree.command(name="ticket_roles", description="Настроить роли анкет или сопоставление ролей приватки")
 @app_commands.describe(
     team="В приватке выбери, к какому составу она относится",
-    coller="Роль коллера", combat="Роль комбата", fpv="Роль FPV-пилота",
+    coller="Роль коллера", fpv="Роль FPV-пилота",
     pilot="Роль пилота", crafter="Роль крафтера", electric="Роль электрика",
     farmer="Роль фермера", builder="Роль билдера",
     invite_channel="Канал, на который бот создаёт приглашение в приватку",
@@ -4266,7 +4263,7 @@ async def ticket_logs_setup(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 async def ticket_roles(interaction: discord.Interaction, team: str | None = None,
                        coller: discord.Role | None = None,
-                       combat: discord.Role | None = None, fpv: discord.Role | None = None,
+                       fpv: discord.Role | None = None,
                        pilot: discord.Role | None = None, crafter: discord.Role | None = None,
                        electric: discord.Role | None = None, farmer: discord.Role | None = None,
                        builder: discord.Role | None = None,
@@ -4280,7 +4277,6 @@ async def ticket_roles(interaction: discord.Interaction, team: str | None = None
     await interaction.response.defer(ephemeral=True)
     direction_supplied = {
         "coller": coller,
-        "combat": combat,
         "fpv": fpv,
         "pilot": pilot,
         "crafter": crafter,
